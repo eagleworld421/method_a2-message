@@ -1,4 +1,4 @@
-<!-- 摘要：记录本工作区各方法代码实现阶段、目录职责和关键可执行能力；Method-A2 已迁入 S0 数据生成模块与特权响应 predictor 模型模块，并新增判据一共享状态可恢复性 Probe 脚本与测试且已完成 1600 事件全量运行；数据集、模型权重与其余实验脚本尚未迁入。 -->
+<!-- 摘要：记录本工作区各方法代码实现阶段、目录职责和关键可执行能力；Method-A2 已迁入 S0 数据生成模块与特权响应 predictor 模型模块，并新增判据一共享状态可恢复性 Probe 脚本与测试，支持线性与浅层非线性两种 probe 家族，且已完成两种口径的 1600 事件全量运行；数据集、模型权重与其余实验脚本尚未迁入。 -->
 
 # 代码生成状态
 
@@ -20,9 +20,12 @@
   - 数据集生成器一个：`dataset_builder.py` 生成 S0 全候选签名数据集，含 `build_dataset`、`generate_signature_bank` 与 `load_dataset`。
   - 支撑工具两个：`waveform.py` 由 OpenDSS 相量锚点合成动态电压相量窗口；`topology.py` 构建候选边、拓扑掩码与节点观测掩码。
 - 已迁入的模型模块：`src/model/` 含包初始化文件与 3 个模块。`privileged_response_predictor.py` 提供 `CandidateConditionedEncoder`、`PairResponseHead` 与 `PrivilegedResponseSystem`；`gnn.py` 提供 `TopologyGNN`；`temporal.py` 提供 `TemporalEncoder`。实测 `teacher.pt` 的全部 87 项状态字典条目可无缺失、无冗余载入，可训练参数 194372。
-- 新增的实验脚本：`scripts/run_error_source_criterion1_probe.py` 实现判据一共享状态可恢复性 Probe，冻结既有编码器后在其表示与观测池化特征上拟合岭回归与多类逻辑回归，含四类负对照、块内一致性、位置可恢复性核验、逐维判定与 9 项产物写出，并对长任务做逐次拟合增量落盘。
-- 新增的测试：`tests/test_error_source_criterion1_probe.py`，28 项，覆盖度量定义、按 block 聚合与子采样、训练侧标准化、正则选择口径、判定分支、报告与 CSV 产物渲染、以及环境差异下的求解器选择。
-- 已完成的运行：`output/error-source-v2/c1run-20260923T083606Z-seed342/criterion-1/`（1600 事件全量）与 `output/error-source-v2/c1smoke-20260923-seed342/criterion-1/`（每划分 8 个 block 的冒烟）。
+- 新增的实验脚本：`scripts/run_error_source_criterion1_probe.py` 实现判据一共享状态可恢复性 Probe，冻结既有编码器后在其表示与观测池化特征上拟合 probe，含四类负对照、块内一致性、位置可恢复性核验、逐维判定与 9 项产物写出，并对长任务做逐次拟合增量落盘。以 `--probe-kinds linear|mlp` 选择 probe 家族：`linear` 为岭回归与多类逻辑回归，`mlp` 为单隐藏层浅层非线性（宽度 × 权重衰减在验证划分上选择，选定配置用 3 个随机种子重训并聚合）。另提供 `--block-limit` 小样本冒烟开关，按 block 截断以保持划分不重叠与块内共享工况两条性质。
+- 新增的测试：`tests/test_error_source_criterion1_probe.py`，34 项，覆盖度量定义、按 block 聚合与子采样、训练侧标准化、正则与宽度选参口径、判定分支、报告与 CSV 产物渲染、两种 probe 家族的分派与聚合规则、以及环境差异下的求解器选择。
+- 已完成的运行：
+  - `output/error-source-v2/c1run-20260923T083606Z-seed342/criterion-1/`：线性口径，1600 事件全量，判定 S1 成立（0.8033）、S2 未定（0.1211）。
+  - `output/error-source-v2/c1nl-20260923-seed342/criterion-1/`：浅层非线性口径，1600 事件全量，判定 S1 成立（0.6665）、S2 未定（0.1657）。
+  - `output/error-source-v2/c1smoke-20260923-seed342/` 与 `c1nl-smoke-20260923-seed342/`：每划分 8 个 block 的冒烟，产物中已标记 `smoke_run`。
 - 运行环境注意事项（已在产物 `config.json` 中固化）：本机 `sklearn 1.0.2` 与 `scipy 1.13.1` 不兼容，`Ridge` 默认 `auto`/`cholesky` 求解器会抛 `TypeError`，改用 `lsqr`；多类逻辑回归改用 `newton-cg`，同一 16 类问题上较 `lbfgs` 快约 119 倍。两项选择均不改变 multinomial 与正则网格口径。
 - 目录状态：`data/`、`checkpoint/` 为空目录并保留 `.gitkeep` 占位；`main.py`、`README.md`、`requirements.txt` 尚未创建。
 - 待迁入内容（来源为 `method_a` 仓库 `code/method-a1/`）：
