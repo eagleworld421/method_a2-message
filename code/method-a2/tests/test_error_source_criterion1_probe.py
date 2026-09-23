@@ -344,6 +344,8 @@ def _synthetic_artifacts():
         "regression_solver": {"solver": "lsqr", "tol": 1e-8, "reason": "scipy 不兼容"},
         "classification_solver": {"solver": "newton-cg", "max_iter": 2000,
                                   "multi_class": "multinomial", "reason": "lbfgs 慢 119 倍"},
+        "probe_kind": "linear",
+        "mlp_grid": None,
         "determinism_note": "无 dropout",
         "distance_convention": "d_S 为平方量",
         "representation_inventory": {
@@ -442,3 +444,118 @@ def test_write_json_is_utf8_and_round_trips(tmp_path):
     text = target.read_text(encoding="utf-8")
     assert "提取失败" in text
     assert np.isclose(json.loads(text)["值"], 0.12)
+
+
+# --------------------------------------------------------------------------
+# 浅层非线性 probe
+# --------------------------------------------------------------------------
+
+def _toy_problem(n_train=240, n_val=80, n_test=80, n_features=24, n_dims=3, seed=0):
+    """构造一个线性可解的小问题，用于验证浅层非线性 probe 的链路。"""
+    rng = np.random.default_rng(seed)
+    weights = rng.normal(size=(n_features, n_dims))
+    def make(count, offset):
+        x = rng.normal(size=(count, n_features))
+        y = x @ weights + rng.normal(scale=0.05, size=(count, n_dims))
+        return x, y, np.arange(offset, offset + count)
+    x_tr, y_tr, i_tr = make(n_train, 0)
+    x_va, y_va, i_va = make(n_val, n_train)
+    x_te, y_te, i_te = make(n_test, n_train + n_val)
+    features = {"train": x_tr, "val": x_va, "test": x_te}
+    target = np.concatenate([y_tr, y_va, y_te], axis=0)
+    splits = {"train": i_tr, "val": i_va, "test": i_te}
+    splits["test_blocks"] = i_te // 4
+    return features, target, splits
+
+
+def test_shallow_mlp_regression_recovers_a_linear_problem(monkeypatch):
+    """浅层非线性 probe 必须能恢复线性可解目标，且选参与报告链路完整。"""
+    monkeypatch.setattr(MODULE, "MLP_EPOCHS", 300)
+    monkeypatch.setattr(MODULE, "MLP_REPORT_SEEDS", (0,))
+    monkeypatch.setattr(MODULE, "MLP_WIDTHS", (64,))
+    monkeypatch.setattr(MODULE, "MLP_WEIGHT_DECAYS", (1e-4,))
+    features, target, splits = _toy_problem()
+    result = MODULE.fit_nonlinear_regression(features, target, splits, 0)
+    assert result["event"]["r2"] > 0.9
+    assert result["selected_mlp"]["width"] == 64
+    assert len(result["selection"]) == 1
+    assert callable(result["predict"])
+    # 块级口径必须走同一个预测函数，且能正常聚合
+    assert np.isfinite(MODULE.block_level_regression(result)["r2"])
+
+
+def test_shallow_mlp_regression_permuted_labels_degrade(monkeypatch):
+    """训练侧标签置换后，浅层非线性 probe 必须退化，作为泄漏检查。"""
+    monkeypatch.setattr(MODULE, "MLP_EPOCHS", 200)
+    monkeypatch.setattr(MODULE, "MLP_REPORT_SEEDS", (0,))
+    monkeypatch.setattr(MODULE, "MLP_WIDTHS", (64,))
+    monkeypatch.setattr(MODULE, "MLP_WEIGHT_DECAYS", (1e-4,))
+    features, target, splits = _toy_problem()
+    honest = MODULE.fit_nonlinear_regression(features, target, splits, 0)
+    permuted = MODULE.fit_nonlinear_regression(features, target, splits, 0,
+                                               permute_train_labels=True)
+    assert honest["event"]["r2"] > 0.9
+    assert permuted["event"]["r2"] < 0.3
+
+
+def test_shallow_mlp_classification_learns_a_separable_problem(monkeypatch):
+    """浅层非线性分类 probe 必须在可分问题上显著高于随机基线。"""
+    monkeypatch.setattr(MODULE, "MLP_EPOCHS", 300)
+    monkeypatch.setattr(MODULE, "MLP_REPORT_SEEDS", (0,))
+    monkeypatch.setattr(MODULE, "MLP_WIDTHS", (64,))
+    monkeypatch.setattr(MODULE, "MLP_WEIGHT_DECAYS", (1e-4,))
+    rng = np.random.default_rng(0)
+    centers = rng.normal(size=(4, 16)) * 4.0
+    def make(count, offset):
+        labels = rng.integers(0, 4, size=count)
+        return centers[labels] + rng.normal(scale=0.3, size=(count, 16)), labels, np.arange(offset, offset + count)
+    x_tr, y_tr, i_tr = make(160, 0)
+    x_va, y_va, i_va = make(60, 160)
+    x_te, y_te, i_te = make(60, 220)
+    features = {"train": x_tr, "val": x_va, "test": x_te}
+    labels = np.concatenate([y_tr, y_va, y_te])
+    splits = {"train": i_tr, "val": i_va, "test": i_te}
+    splits["test_blocks"] = i_te // 4
+    result = MODULE.fit_nonlinear_classification(features, labels, splits, 4, 0)
+    assert result["event"]["accuracy"] > 0.9
+    assert callable(result["predict"])
+
+
+def test_average_predictors_means_regression_and_votes_classification():
+    """多随机种子的聚合规则：回归取均值，分类取多数票。"""
+    reg = MODULE._average_predictors([
+        lambda x: np.full((x.shape[0], 2), 1.0),
+        lambda x: np.full((x.shape[0], 2), 3.0),
+    ])
+    assert reg(np.zeros((5, 2)))[0].tolist() == pytest.approx([2.0, 2.0])
+
+    votes = MODULE._average_predictors([
+        lambda x: np.zeros(x.shape[0], dtype=np.int64),
+        lambda x: np.zeros(x.shape[0], dtype=np.int64),
+        lambda x: np.ones(x.shape[0], dtype=np.int64),
+    ])
+    assert votes(np.zeros((5, 2))).tolist() == [0, 0, 0, 0, 0]
+
+
+def test_fit_probe_dispatches_by_kind(monkeypatch):
+    """probe 分派必须按类型选择线性或浅层非线性拟合器。"""
+    monkeypatch.setattr(MODULE, "MLP_EPOCHS", 50)
+    monkeypatch.setattr(MODULE, "MLP_REPORT_SEEDS", (0,))
+    monkeypatch.setattr(MODULE, "MLP_WIDTHS", (32,))
+    monkeypatch.setattr(MODULE, "MLP_WEIGHT_DECAYS", (1e-4,))
+    features, target, splits = _toy_problem(n_train=120, n_val=40, n_test=40)
+    linear = MODULE.fit_probe(features, target, splits, 0, kind="linear", task="regression")
+    nonlinear = MODULE.fit_probe(features, target, splits, 0, kind="mlp", task="regression")
+    assert linear["model"] is not None and linear["selected_alpha"] is not None
+    assert nonlinear["model"] is None and nonlinear["selected_mlp"] is not None
+    with pytest.raises(ValueError):
+        MODULE.fit_probe(features, target, splits, 0, kind="unknown", task="regression")
+
+
+def test_selection_text_renders_all_probe_kinds():
+    """报告必须能同时渲染线性与非线性两种选参结果。"""
+    assert "MLP" in MODULE._selection_text(
+        {"selected_mlp": {"width": 64, "weight_decay": 1e-4, "seeds": [0]}}
+    )
+    assert "C =" in MODULE._selection_text({"selected_C": 1.0})
+    assert "α =" in MODULE._selection_text({"selected_alpha": 0.1})

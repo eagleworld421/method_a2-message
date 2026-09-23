@@ -73,6 +73,15 @@ RIDGE_TOL = 1e-8
 # 口径。lbfgs 的耗时来自其拟牛顿近似在近奇异 Hessian 上反复试探步长。
 CLASSIFICATION_SOLVER = "newton-cg"
 
+# 浅层非线性 probe 的网格与预算。刻意只用一个隐藏层、宽度不超过 512，以维持
+# 设计文档第 3 节"另接一个很小的模型"的定位；正则强度由验证划分选择。
+MLP_WIDTHS = (32, 128, 512)
+MLP_WEIGHT_DECAYS = (1e-4, 1e-2)
+MLP_EPOCHS = 400
+MLP_LEARNING_RATE = 1e-3
+MLP_SELECTION_SEED = 0
+MLP_REPORT_SEEDS = (0, 1, 2)
+
 DATASET_FILES = (
     "X_obs.npy", "paired_response.npy", "candidate_features.npy",
     "node_features.npy", "edge_index.npy", "edge_attr.npy",
@@ -133,6 +142,11 @@ def parse_args():
         "--block-limit", type=int, default=None,
         help="每个划分最多使用的 block 数，用于快速冒烟；默认使用全部 block。"
              "按 block 截断可保持划分不重叠与块内共享工况两条性质。",
+    )
+    parser.add_argument(
+        "--probe-kinds", choices=("linear", "mlp"), default="linear",
+        help="probe 拟合器：linear 为岭回归与多类逻辑回归；mlp 为单隐藏层浅层非线性。"
+             "一次运行只使用一种，以保证产物的口径单一、可独立复核。",
     )
     return parser.parse_args()
 
@@ -414,6 +428,7 @@ def fit_regression(features: dict, target: np.ndarray, splits: dict, seed: int,
         "target_stats": target_stats,
         "event": regression_metrics(target[splits["test"]], predicted_raw),
         "model": best_model,
+        "predict": best_model.predict,
         "test_features": x_test_s,
         "test_blocks": splits["test_blocks"],
         "target_test": target[splits["test"]],
@@ -479,16 +494,217 @@ def fit_classification(features: dict, labels: np.ndarray, splits: dict, n_class
         "selected_C": best_c,
         "event": classification_metrics(y_test, best_model.predict(x_test_s), n_classes),
         "model": best_model,
+        "predict": best_model.predict,
         "test_features": x_test_s,
         "test_blocks": splits["test_blocks"],
         "labels_test": labels[splits["test"]],
     }
 
 
+def _train_shallow_mlp(x_train, y_train, out_dim, task, width, weight_decay,
+                       epochs, learning_rate, seed):
+    """全批量训练一个单隐藏层 MLP，刻意保持浅层以维持探针的小模型定位。"""
+    import torch
+    import torch.nn as nn
+
+    torch.manual_seed(int(seed))
+    module = nn.Sequential(
+        nn.Linear(int(x_train.shape[1]), int(width)),
+        nn.ReLU(),
+        nn.Linear(int(width), int(out_dim)),
+    )
+    optimizer = torch.optim.Adam(
+        module.parameters(), lr=float(learning_rate), weight_decay=float(weight_decay)
+    )
+    x_tensor = torch.as_tensor(x_train, dtype=torch.float32)
+    if task == "regression":
+        y_tensor = torch.as_tensor(y_train, dtype=torch.float32)
+        loss_function = nn.functional.mse_loss
+    else:
+        y_tensor = torch.as_tensor(y_train, dtype=torch.long)
+        loss_function = nn.functional.cross_entropy
+    for _ in range(int(epochs)):
+        optimizer.zero_grad()
+        loss = loss_function(module(x_tensor), y_tensor)
+        loss.backward()
+        optimizer.step()
+    module.eval()
+    return module
+
+
+def _seeded_predictors(module, task, seed):
+    """把单个网络包装为“接受标准化特征、返回标准化输出或类别”的预测函数。"""
+    import torch
+
+    def predict(features: np.ndarray) -> np.ndarray:
+        with torch.no_grad():
+            outputs = module(torch.as_tensor(np.asarray(features, dtype=np.float32))).numpy()
+        if task == "classification":
+            return outputs.argmax(axis=1).astype(np.int64)
+        return outputs.astype(np.float64)
+
+    return predict
+
+
+def _average_predictors(predictors: list):
+    """多随机种子预测平均；分类按多数投票，回归按均值。"""
+    def predict(features: np.ndarray) -> np.ndarray:
+        stacked = np.stack([fn(features) for fn in predictors], axis=0)
+        if stacked.dtype.kind in "iu":
+            votes = np.stack(
+                [(stacked == label).sum(axis=0) for label in range(int(stacked.max()) + 1)],
+                axis=1,
+            )
+            return votes.argmax(axis=1).astype(np.int64)
+        return stacked.mean(axis=0)
+
+    return predict
+
+
+def fit_nonlinear_regression(features: dict, target: np.ndarray, splits: dict, seed: int,
+                             permute_train_labels: bool = False) -> dict:
+    """浅层非线性回归 probe：验证划分选宽度与权重衰减，测试划分只报告一次。"""
+    x_train = features["train"]
+    x_val = features["val"]
+    x_test = features["test"]
+    (x_train_s, x_val_s, x_test_s), target_scaled, target_stats = _scale_regression(
+        x_train, [x_val, x_test], target, splits
+    )
+    y_train = target_scaled[splits["train"]].copy()
+    if permute_train_labels:
+        rng = np.random.default_rng(seed)
+        y_train = y_train[rng.permutation(y_train.shape[0])]
+    y_val = target_scaled[splits["val"]]
+
+    selection = []
+    best_key, best_score = None, -np.inf
+    for width in MLP_WIDTHS:
+        for weight_decay in MLP_WEIGHT_DECAYS:
+            module = _train_shallow_mlp(
+                x_train_s, y_train, y_train.shape[1], "regression", width,
+                weight_decay, MLP_EPOCHS, MLP_LEARNING_RATE, MLP_SELECTION_SEED,
+            )
+            score = regression_metrics(
+                y_val, _seeded_predictors(module, "regression", MLP_SELECTION_SEED)(x_val_s)
+            )["r2"]
+            selection.append({
+                "width": int(width), "weight_decay": float(weight_decay),
+                "epochs": int(MLP_EPOCHS), "val_r2": score,
+            })
+            if np.isfinite(score) and score > best_score:
+                best_key, best_score = (int(width), float(weight_decay)), score
+    if best_key is None:
+        raise RuntimeError("浅层非线性回归未产出可用模型")
+
+    predictors = []
+    for report_seed in MLP_REPORT_SEEDS:
+        module = _train_shallow_mlp(
+            x_train_s, y_train, y_train.shape[1], "regression", best_key[0],
+            best_key[1], MLP_EPOCHS, MLP_LEARNING_RATE, report_seed,
+        )
+        predictors.append(_seeded_predictors(module, "regression", report_seed))
+    predict = _average_predictors(predictors)
+
+    target_mean = np.asarray(target_stats["mean"], dtype=np.float64)
+    target_std = np.asarray(target_stats["std"], dtype=np.float64)
+    predicted_raw = predict(x_test_s) * target_std + target_mean
+    return {
+        "selection": selection,
+        "selected_alpha": None,
+        "selected_mlp": {"width": best_key[0], "weight_decay": best_key[1],
+                         "seeds": list(MLP_REPORT_SEEDS), "epochs": int(MLP_EPOCHS)},
+        "target_stats": target_stats,
+        "event": regression_metrics(target[splits["test"]], predicted_raw),
+        "model": None,
+        "predict": predict,
+        "test_features": x_test_s,
+        "test_blocks": splits["test_blocks"],
+        "target_test": target[splits["test"]],
+    }
+
+
+def fit_nonlinear_classification(features: dict, labels: np.ndarray, splits: dict,
+                                 n_classes: int, seed: int,
+                                 permute_train_labels: bool = False) -> dict:
+    """浅层非线性分类 probe：验证划分选宽度与权重衰减，测试划分只报告一次。"""
+    x_train = features["train"]
+    x_val = features["val"]
+    x_test = features["test"]
+    x_train_s, (x_val_s, x_test_s) = standardize(x_train, [x_val, x_test])
+
+    y_train = labels[splits["train"]].copy()
+    if permute_train_labels:
+        rng = np.random.default_rng(seed)
+        y_train = y_train[rng.permutation(y_train.size)]
+    y_val = labels[splits["val"]]
+    y_test = labels[splits["test"]]
+
+    selection = []
+    best_key, best_score = None, -np.inf
+    for width in MLP_WIDTHS:
+        for weight_decay in MLP_WEIGHT_DECAYS:
+            module = _train_shallow_mlp(
+                x_train_s, y_train, n_classes, "classification", width,
+                weight_decay, MLP_EPOCHS, MLP_LEARNING_RATE, MLP_SELECTION_SEED,
+            )
+            score = classification_metrics(
+                y_val, _seeded_predictors(module, "classification", MLP_SELECTION_SEED)(x_val_s),
+                n_classes,
+            )["accuracy"]
+            selection.append({
+                "width": int(width), "weight_decay": float(weight_decay),
+                "epochs": int(MLP_EPOCHS), "val_accuracy": score,
+            })
+            if np.isfinite(score) and score > best_score:
+                best_key, best_score = (int(width), float(weight_decay)), score
+    if best_key is None:
+        raise RuntimeError("浅层非线性分类未产出可用模型")
+
+    predictors = []
+    for report_seed in MLP_REPORT_SEEDS:
+        module = _train_shallow_mlp(
+            x_train_s, y_train, n_classes, "classification", best_key[0],
+            best_key[1], MLP_EPOCHS, MLP_LEARNING_RATE, report_seed,
+        )
+        predictors.append(_seeded_predictors(module, "classification", report_seed))
+    predict = _average_predictors(predictors)
+
+    return {
+        "selection": selection,
+        "selected_C": None,
+        "selected_mlp": {"width": best_key[0], "weight_decay": best_key[1],
+                         "seeds": list(MLP_REPORT_SEEDS), "epochs": int(MLP_EPOCHS)},
+        "event": classification_metrics(y_test, predict(x_test_s), n_classes),
+        "model": None,
+        "predict": predict,
+        "test_features": x_test_s,
+        "test_blocks": splits["test_blocks"],
+        "labels_test": labels[splits["test"]],
+    }
+
+
+def fit_probe(features: dict, target: np.ndarray, splits: dict, seed: int,
+              kind: str, task: str, n_classes: int = None,
+              permute_train_labels: bool = False) -> dict:
+    """按 probe 类型分派到线性或浅层非线性拟合器。"""
+    if kind == "linear":
+        if task == "regression":
+            return fit_regression(features, target, splits, seed, permute_train_labels)
+        return fit_classification(features, target, splits, n_classes, seed,
+                                  permute_train_labels)
+    if kind == "mlp":
+        if task == "regression":
+            return fit_nonlinear_regression(features, target, splits, seed,
+                                            permute_train_labels)
+        return fit_nonlinear_classification(features, target, splits, n_classes, seed,
+                                            permute_train_labels)
+    raise ValueError(f"未知 probe 类型：{kind}")
+
+
 def block_level_regression(result: dict) -> dict:
     """块级回归口径：块内特征先取均值，再预测一次，与部署时一次一个工况一致。"""
     aggregated, blocks = aggregate_by_block(result["test_features"], result["test_blocks"])
-    predictions = result["model"].predict(aggregated)
+    predictions = result["predict"](aggregated)
     stats = result["target_stats"]
     mean = np.asarray(stats["mean"], dtype=np.float64)
     std = np.asarray(stats["std"], dtype=np.float64)
@@ -502,7 +718,7 @@ def block_level_regression(result: dict) -> dict:
 def block_level_classification(result: dict, n_classes: int) -> dict:
     """块级分类口径：块内特征先取均值，再预测一次。"""
     aggregated, blocks = aggregate_by_block(result["test_features"], result["test_blocks"])
-    predictions = result["model"].predict(aggregated)
+    predictions = result["predict"](aggregated)
     truth_per_block = np.asarray(
         [result["labels_test"][result["test_blocks"] == value][0] for value in blocks],
         dtype=np.int64,
@@ -521,10 +737,10 @@ def per_dimension_regression(result: dict, dim_names: list) -> list:
         array = np.asarray(values, dtype=np.float64)
         return array[:, None] if array.ndim == 1 else array
 
-    predicted_event = two_dimensional(result["model"].predict(result["test_features"])) * std + mean
+    predicted_event = two_dimensional(result["predict"](result["test_features"])) * std + mean
     truth_event = two_dimensional(result["target_test"])
     aggregated, blocks = aggregate_by_block(result["test_features"], result["test_blocks"])
-    predicted_block = two_dimensional(result["model"].predict(aggregated)) * std + mean
+    predicted_block = two_dimensional(result["predict"](aggregated)) * std + mean
     truth_block = np.stack(
         [truth_event[result["test_blocks"] == value][0] for value in blocks], axis=0
     )
@@ -552,7 +768,8 @@ def per_dimension_regression(result: dict, dim_names: list) -> list:
 # 步骤四：负对照
 # --------------------------------------------------------------------------
 
-def build_negative_controls(arrays: dict, splits: dict, targets: dict, seed: int) -> dict:
+def build_negative_controls(arrays: dict, splits: dict, targets: dict, seed: int,
+                            kind: str = "linear") -> dict:
     """执行设计文档第 6.5 节规定的四类负对照。"""
     rng = np.random.default_rng(seed)
     primary = arrays["rep_all"]
@@ -565,28 +782,30 @@ def build_negative_controls(arrays: dict, splits: dict, targets: dict, seed: int
         ("zero_representation", zeros, "全零特征替换表示"),
     ):
         features = {key: replacement[splits[key]] for key in ("train", "val", "test")}
-        result = fit_regression(features, targets["H"], splits, seed)
+        result = fit_probe(features, targets["H"], splits, seed, kind=kind, task="regression")
         controls[name] = {
             "description": description,
             "target": "H",
             "event_r2": result["event"]["r2"],
             "block_r2": block_level_regression(result)["r2"],
             "selected_alpha": result["selected_alpha"],
+            "selected_mlp": result.get("selected_mlp"),
         }
 
     features = {key: primary[splits[key]] for key in ("train", "val", "test")}
-    permuted = fit_regression(features, targets["H"], splits, seed, permute_train_labels=True)
+    permuted = fit_probe(features, targets["H"], splits, seed, kind=kind,
+                         task="regression", permute_train_labels=True)
     controls["label_permutation"] = {
         "description": "训练侧打乱 H 标签，测试侧使用真实标签",
         "target": "H",
         "event_r2": permuted["event"]["r2"],
         "block_r2": block_level_regression(permuted)["r2"],
         "selected_alpha": permuted["selected_alpha"],
+        "selected_mlp": permuted.get("selected_mlp"),
     }
 
-    location = fit_classification(
-        features, targets["true_location"], splits, 16, seed, permute_train_labels=False
-    )
+    location = fit_probe(features, targets["true_location"], splits, seed, kind=kind,
+                         task="classification", n_classes=16)
     controls["position_positive_control"] = {
         "description": "真实位置 16 类分类，随机基线 1/16=0.0625",
         "target": "true_location",
@@ -866,6 +1085,17 @@ def _fmt(value) -> str:
     return str(value)
 
 
+def _selection_text(entry: dict) -> str:
+    """把选中的正则强度或浅层非线性配置渲染成一行文本。"""
+    if entry.get("selected_mlp"):
+        info = entry["selected_mlp"]
+        return (f"选中 MLP 配置：宽度 {info['width']}、"
+                f"权重衰减 {_fmt(info['weight_decay'])}、种子 {info['seeds']}")
+    if entry.get("selected_C") is not None:
+        return f"选中 C = {_fmt(entry['selected_C'])}"
+    return f"选中 α = {_fmt(entry['selected_alpha'])}"
+
+
 def write_report(path: Path, config: dict, probe_metrics: dict, controls: dict,
                  consistency: dict, position: dict, decision: dict,
                  per_dimension: list) -> None:
@@ -945,6 +1175,14 @@ def write_report(path: Path, config: dict, probe_metrics: dict, controls: dict,
     add(f"- 标准化：{config['standardization']}")
     add(f"- 正则候选集：分类 C ∈ {config['regularization_grid']['classification_C']}；"
         f"回归 α ∈ {config['regularization_grid']['regression_alpha']}")
+    add(f"- probe 拟合器：`{config['probe_kind']}`"
+        + (
+            f"；{config['mlp_grid']['architecture']}，网格为 宽度 {config['mlp_grid']['widths']} ×"
+            f" 权重衰减 {config['mlp_grid']['weight_decays']}，epochs"
+            f" {config['mlp_grid']['epochs']}；{config['mlp_grid']['selection_rule']}"
+            if config.get("mlp_grid")
+            else "（岭回归与多类逻辑回归，均为线性口径）"
+        ))
     add(f"- 回归求解器：`{config['regression_solver']['solver']}`，"
         f"tol = {config['regression_solver']['tol']}；理由：{config['regression_solver']['reason']}")
     add(f"- 分类求解器：`{config['classification_solver']['solver']}`，"
@@ -992,7 +1230,7 @@ def write_report(path: Path, config: dict, probe_metrics: dict, controls: dict,
             entry = probe_metrics.get(f"H|{source}")
             if not entry:
                 continue
-            add(f"- `{source}`：选中 α = {_fmt(entry['selected_alpha'])}；"
+            add(f"- `{source}`：{_selection_text(entry)}；"
                 f"事件级 R² = {_fmt(entry['event']['r2'])}、"
                 f"RMSE = {_fmt(entry['event']['rmse'])}、MAE = {_fmt(entry['event']['mae'])}；"
                 f"块级 R² = {_fmt(entry['block']['r2'])}、"
@@ -1010,19 +1248,24 @@ def write_report(path: Path, config: dict, probe_metrics: dict, controls: dict,
             if not entry:
                 continue
             if entry["task"] == "regression":
-                add(f"- `{source}`：选中 α = {_fmt(entry['selected_alpha'])}；"
+                add(f"- `{source}`：{_selection_text(entry)}；"
                     f"事件级 R² = {_fmt(entry['event']['r2'])}；"
                     f"块级 R² = {_fmt(entry['block']['r2'])}")
             else:
-                add(f"- `{source}`：选中 C = {_fmt(entry['selected_C'])}；"
+                add(f"- `{source}`：{_selection_text(entry)}；"
                     f"事件级准确率 = {_fmt(entry['event']['accuracy'])}、"
                     f"宏平均 F1 = {_fmt(entry['event']['macro_f1'])}；"
                     f"块级准确率 = {_fmt(entry['block']['accuracy'])}")
         add("")
     add("### 正则强度选择过程")
     add("")
-    add("每个（目标，特征源）组合都在验证划分上独立选参，测试划分只报告一次，"
-        "完整选参曲线见 `probe_metrics.json` 的 `alpha_selection` 与 `C_selection` 字段。")
+    if config.get("mlp_grid"):
+        add("每个（目标，特征源）组合都在验证划分上独立选择隐藏层宽度与权重衰减，"
+            "选定配置再用多个随机种子重训并聚合预测；测试划分只报告一次。"
+            "完整网格结果见 `probe_metrics.json` 的 `alpha_selection` 与 `C_selection` 字段。")
+    else:
+        add("每个（目标，特征源）组合都在验证划分上独立选参，测试划分只报告一次，"
+            "完整选参曲线见 `probe_metrics.json` 的 `alpha_selection` 与 `C_selection` 字段。")
     add("")
     add("## 6. 逐维工况结果")
     add("")
@@ -1218,6 +1461,9 @@ def main() -> None:
     print("[3/6] 主 probe 拟合", flush=True)
     probe_metrics = {}
     regression_results = {}
+    # 逐维报告只用到这三个组合；其余结果不再持有，避免长期驻留大量神经网络模块。
+    needed_for_per_dimension = {("H", "rep_all"), ("H", "obs_full"),
+                                ("log1p_impedance", "rep_all")}
     partial_path = output_dir / "probe_metrics.partial.json"
 
     def persist_partial() -> None:
@@ -1234,26 +1480,36 @@ def main() -> None:
     ):
         target = targets[target_name]
         for source_name in feature_names + observation_names + ["concat_rep_all_obs_full"]:
-            result = fit_regression(sliced(source_name), target, splits, args.seed)
-            regression_results[(target_name, source_name)] = result
+            result = fit_probe(sliced(source_name), target, splits, args.seed,
+                               kind=args.probe_kinds, task="regression")
+            if (target_name, source_name) in needed_for_per_dimension:
+                regression_results[(target_name, source_name)] = result
             probe_metrics[f"{target_name}|{source_name}"] = {
                 "target": target_name, "feature_source": source_name,
-                "task": "regression", "selected_alpha": result["selected_alpha"],
+                "probe_kind": args.probe_kinds, "task": "regression",
+                "selected_alpha": result["selected_alpha"],
+                "selected_mlp": result.get("selected_mlp"),
                 "alpha_selection": result["selection"],
                 "event": result["event"], "block": block_level_regression(result),
             }
+            block_r2 = probe_metrics[f"{target_name}|{source_name}"]["block"]["r2"]
+            event_r2 = probe_metrics[f"{target_name}|{source_name}"]["event"]["r2"]
+            del result
             persist_partial()
             print(f"      {target_name:<16} {source_name:<24} "
-                  f"event R²={result['event']['r2']:+.4f} "
-                  f"block R²={block_level_regression(result)['r2']:+.4f}", flush=True)
+                  f"event R²={event_r2:+.4f} block R²={block_r2:+.4f}", flush=True)
 
     for target_name, n_classes in (("fault_class", 5), ("true_location", 16)):
         labels = targets[target_name]
         for source_name in feature_names + observation_names + ["concat_rep_all_obs_full"]:
-            result = fit_classification(sliced(source_name), labels, splits, n_classes, args.seed)
+            result = fit_probe(sliced(source_name), labels, splits, args.seed,
+                               kind=args.probe_kinds, task="classification",
+                               n_classes=n_classes)
             probe_metrics[f"{target_name}|{source_name}"] = {
                 "target": target_name, "feature_source": source_name,
-                "task": "classification", "selected_C": result["selected_C"],
+                "probe_kind": args.probe_kinds, "task": "classification",
+                "selected_C": result["selected_C"],
+                "selected_mlp": result.get("selected_mlp"),
                 "C_selection": result["selection"],
                 "event": result["event"],
                 "block": block_level_classification(result, n_classes),
@@ -1270,7 +1526,8 @@ def main() -> None:
     })
 
     print("[4/6] 负对照", flush=True)
-    controls = build_negative_controls(arrays, splits, targets, args.seed)
+    controls = build_negative_controls(arrays, splits, targets, args.seed,
+                                       kind=args.probe_kinds)
     for name, value in controls.items():
         print(f"      {name}: {json.dumps(value, ensure_ascii=False)[:150]}", flush=True)
 
@@ -1347,7 +1604,16 @@ def main() -> None:
             "leakage_protection": "按 block 切分，禁止按事件随机切分",
         },
         "standardization": "probe 输入用训练侧统计量；回归目标按训练侧均值与标准差标准化后拟合",
+        "probe_kind": args.probe_kinds,
         "regularization_grid": {"classification_C": list(C_GRID), "regression_alpha": list(ALPHA_GRID)},
+        "mlp_grid": {
+            "widths": list(MLP_WIDTHS), "weight_decays": list(MLP_WEIGHT_DECAYS),
+            "epochs": int(MLP_EPOCHS), "learning_rate": float(MLP_LEARNING_RATE),
+            "selection_seed": int(MLP_SELECTION_SEED),
+            "report_seeds": list(MLP_REPORT_SEEDS),
+            "architecture": "单隐藏层 MLP（Linear-ReLU-Linear），全批量 Adam",
+            "selection_rule": "宽度与权重衰减在验证划分上选择；选定配置用多个随机种子重训并聚合预测",
+        } if args.probe_kinds == "mlp" else None,
         "regression_solver": {
             "solver": RIDGE_SOLVER, "tol": RIDGE_TOL,
             "reason": (
@@ -1364,8 +1630,12 @@ def main() -> None:
             ),
         },
         "selected_regularization": {
-            f"{target}|{source}": probe_metrics[f"{target}|{source}"]
-            .get("selected_C", probe_metrics[f"{target}|{source}"].get("selected_alpha"))
+            f"{target}|{source}": (
+                probe_metrics[f"{target}|{source}"].get("selected_mlp")
+                if args.probe_kinds == "mlp"
+                else probe_metrics[f"{target}|{source}"].get("selected_C",
+                     probe_metrics[f"{target}|{source}"].get("selected_alpha"))
+            )
             for target in ("H", "log1p_impedance", "fault_class", "true_location")
             for source in ("rep_all", "obs_full")
         },
