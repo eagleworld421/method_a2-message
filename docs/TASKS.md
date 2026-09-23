@@ -18,6 +18,16 @@
 
 ## 任务列表
 
+### A2-MIG-002：迁入 S0 数据生成模块
+
+- 任务 ID：A2-MIG-002
+- 需求摘要：从 `method_a` 仓库 `code/method-a1/src/data_generation/` 迁入仿真后端、S0 数据集生成模块与支撑工具，归档至 `code/method-a2/src/data_generation/`，并更新代码生成状态记录。
+- 分支：`main`（沿用仓库初始化分支，尚未设置远端，未推送）
+- 时间：任务开始 2026-09-23 / 分支创建沿用既有分支 / 合并待定
+- 关键决策：迁移范围限定为两个仿真后端（`opendss_sim.py` 与 `mock_sim.py`）、S0 数据集生成器（`dataset_builder.py`）与两个支撑工具（`waveform.py`、`topology.py`），共 5 个模块；`e0_builder.py`、`e0_cov_builder.py`、`e4_a0_builder.py` 与 `paired_response_builder.py` 四个数据集生成器经确认不迁入；模块内容逐字节保留，仅把包初始化文件的模块级 docstring 由 Method-A1 改为 Method-A2；不迁入依赖这些模块的训练器、损失、模型、识别性与脚本，故本工作区当前不具备实验执行能力；`src/` 已由子包承载，其 `.gitkeep` 占位随之删除。
+- 已知局限：唯一迁入的生成器 `build_dataset` 默认后端为需要 COM 注册的 OpenDSS `FaultSimulator`，本工作区未验证任何真实数据生成运行，仅完成 5 个模块的导入验证；其驱动脚本 `scripts/generate_dataset.py` 未迁入，目前只能通过模块接口调用；`src/` 缺少包初始化文件，`src.data_generation` 依赖命名空间包机制导入；迁移后模块内部保留 `code/method-a1` 时代的私有成员耦合，未作重构。
+- 状态：待审查
+
 ### A2-MIG-001：迁移 Method-A2 项目架构至本工作区
 
 - 任务 ID：A2-MIG-001
