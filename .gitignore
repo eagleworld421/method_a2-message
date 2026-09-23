@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+.pytest_cache/
+
+# Node.js
+node_modules/
+
+# 方法运行数据与实验产物（忽略目录内容，但保留各目录的 .gitkeep 占位）
+code/method-*/data/**
+code/method-*/checkpoint/**
+code/method-*/output/**
+code/method-*/logs/**
+!code/method-*/data/.gitkeep
+!code/method-*/checkpoint/.gitkeep
+!code/method-*/output/.gitkeep
+!code/method-*/logs/.gitkeep
+
+# 环境变量与敏感信息
+.env
+.env.local
+.env.*.local
+
+# 编辑器与系统文件
+.vscode/
+.DS_Store
+
+# 日志
+*.log

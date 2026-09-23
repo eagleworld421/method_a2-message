@@ -1,0 +1,26 @@
+#!/bin/sh
+# 校验非 Checkpoint commit 是否包含必要的 trailer。
+
+MSG_FILE="$1"
+SUBJECT=$(sed -n '1p' "$MSG_FILE")
+
+case "$SUBJECT" in
+  "[WIP]"*)
+    exit 0
+    ;;
+esac
+
+MISSING=""
+for TRAILER in Agent-Task Agent-Decision Agent-Limitation; do
+  if ! grep -Eq "^${TRAILER}: .+" "$MSG_FILE"; then
+    MISSING="${MISSING} ${TRAILER}"
+  fi
+done
+
+if [ -n "$MISSING" ]; then
+  echo "COMMIT REJECTED: 缺少必要 trailer:${MISSING}"
+  echo "要求：Agent-Task、Agent-Decision、Agent-Limitation"
+  exit 1
+fi
+
+exit 0
