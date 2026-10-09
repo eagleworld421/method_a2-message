@@ -11,7 +11,7 @@ def build_dynamic_window(
     pre_cycles: float = 1.0,
     post_cycles: float = 2.0,
     rng=None,
-    perturbation_scale: float = 1.0,
+    perturbation_scale: float = 0.0,
     fault_delay_steps: int = 0,
 ) -> np.ndarray:
     """生成 `[N,T,6]` 的实部/虚部动态窗口。

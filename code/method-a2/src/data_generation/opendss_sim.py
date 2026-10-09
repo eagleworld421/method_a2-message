@@ -1,5 +1,7 @@
 """基于 OpenDSS COM 接口的故障场景仿真器。"""
 
+from __future__ import annotations
+
 import gc
 import warnings
 from dataclasses import dataclass
@@ -9,7 +11,6 @@ from typing import Optional
 import numpy as np
 
 FAULT_CLASSES = {0: "LG", 1: "LL", 2: "LLG", 3: "LLLG", 4: "LLL"}
-_FAULT_N_PHASES = {0: 1, 1: 2, 2: 2, 3: 3, 4: 3}
 _DSS_CASES = {
     "ieee13": r"C:\Program Files\OpenDSS\IEEETestCases\13Bus\IEEE13Nodeckt.dss",
     "ieee37": r"C:\Program Files\OpenDSS\IEEETestCases\37Bus\ieee37.dss",
@@ -259,26 +260,39 @@ class FaultSimulator:
             phases.append(nodes)
         return phases
 
-    def _apply_fault(self, config: FaultConfig) -> None:
-        """在目标母线注入故障并重新求解。"""
+    def _apply_fault(self, config: FaultConfig) -> tuple[bool, tuple[int, ...] | None]:
+        """在目标母线注入故障并重新求解，返回是否可行与实际使用的相别。
+
+        故障相别必须落在该母线实际存在的相别上：母线相别不足时，仅指定相数的
+        命令会被 OpenDSS 静默忽略，使故障不生效。此处先按母线可用相别筛出物理
+        可行的相别组合，再交给 build_fault_command 构造带明确相别的命令。
+        若该母线不存在支持该故障类型的相别组合，则返回 (False, None)，由调用方
+        按数据契约处理，不在此处抛出异常。
+        """
         if not 0 <= config.fault_bus < len(self._bus_names):
             raise IndexError(f"故障母线越界：{config.fault_bus}")
         try:
             bus_name = self._bus_names[config.fault_bus]
-            if config.fault_phases is None:
-                n_phases = _FAULT_N_PHASES[config.fault_class]
-                command = (
-                    f"New Fault.F1 bus1={bus_name} phases={n_phases} r={config.z_fault}"
-                )
-            else:
-                command = build_fault_command(
-                    bus_name,
-                    config.fault_class,
-                    config.z_fault,
-                    config.fault_phases,
-                )
+            phases = config.fault_phases
+            if phases is None:
+                specs = [
+                    spec for spec in enumerate_fault_specs(
+                        self._bus_phase_nodes[config.fault_bus]
+                    )
+                    if spec.fault_class == config.fault_class
+                ]
+                if not specs:
+                    return False, None
+                phases = specs[0].phases
+            command = build_fault_command(
+                bus_name,
+                config.fault_class,
+                config.z_fault,
+                phases,
+            )
             self._dss.Text.Command = command
             self._dss.ActiveCircuit.Solution.Solve()
+            return True, tuple(int(value) for value in phases)
         except Exception as exc:
             raise RuntimeError(
                 f"OpenDSS 故障求解失败：case={self.case_name}, "
@@ -312,11 +326,26 @@ class FaultSimulator:
             raise ValueError(f"未知故障类型：{config.fault_class}")
         self._compile_and_solve_base(config.load_multipliers)
         pre_v = self._read_voltages()
-        self._apply_fault(config)
+        applied, used_phases = self._apply_fault(config)
+        if not applied:
+            # 该母线无可用相别组合支持此故障类型：故障后仍取无故障基态，
+            # 由数据生成层依据 fault_feasible 标记把该候选置为无效
+            return {
+                "pre_v": pre_v,
+                "post_v": pre_v.copy(),
+                "fault_feasible": False,
+                "fault_phases": None,
+                "y_detect": 1,
+                "y_loc": config.fault_bus,
+                "y_class": config.fault_class,
+                "y_resist": float(config.z_fault),
+            }
         post_v = self._read_voltages()
         return {
             "pre_v": pre_v,
             "post_v": post_v,
+            "fault_feasible": True,
+            "fault_phases": used_phases,
             "y_detect": 1,
             "y_loc": config.fault_bus,
             "y_class": config.fault_class,

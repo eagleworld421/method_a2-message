@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-METHOD_DIR = Path(__file__).resolve().parents[1]
+METHOD_DIR = Path(__file__).absolute().parents[1]
 if str(METHOD_DIR) not in sys.path:
     sys.path.insert(0, str(METHOD_DIR))
 

@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-METHOD_DIR = Path(__file__).resolve().parents[1]
+METHOD_DIR = Path(__file__).absolute().parents[1]
 SCRIPTS_DIR = METHOD_DIR / "scripts"
 for path in (str(METHOD_DIR), str(SCRIPTS_DIR)):
     if path not in sys.path:
