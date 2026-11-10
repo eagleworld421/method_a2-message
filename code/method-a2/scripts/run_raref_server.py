@@ -76,8 +76,18 @@ def run_child(run_id, label, arguments):
     with log_path.open("w", encoding="utf-8") as handle:
         handle.write(json.dumps(command, ensure_ascii=False) + "\n")
         handle.flush()
-        subprocess.run(command, cwd=METHOD_DIR, env=environment, stdout=handle,
-                       stderr=subprocess.STDOUT, check=True)
+        if label == "train":
+            with subprocess.Popen(command, cwd=METHOD_DIR, env=environment, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, encoding="utf-8", errors="replace") as child:
+                for line in child.stdout:
+                    handle.write(line)
+                    handle.flush()
+                    print(line, end="", flush=True)
+                if child.wait():
+                    raise subprocess.CalledProcessError(child.returncode, command)
+        else:
+            subprocess.run(command, cwd=METHOD_DIR, env=environment, stdout=handle,
+                           stderr=subprocess.STDOUT, check=True)
 
 
 def synthetic_data(directory):
@@ -112,6 +122,7 @@ def parse_args(argv=None):
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--no-cuda-cache", action="store_true", help="训练时关闭显存数据缓存")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", args.run_id):
         parser.error("run-id 只允许字母、数字、点、下划线与连字符")
@@ -122,6 +133,8 @@ def parse_args(argv=None):
         parser.error("验证与测试必须复用训练记录，不可覆盖 epochs 或 seed")
     if args.stage == "smoke" and args.dataset is not None:
         parser.error("合成冒烟不使用正式数据集，请勿指定 dataset")
+    if args.no_cuda_cache and args.stage in ("check", "validate", "test"):
+        parser.error("--no-cuda-cache 仅用于包含训练的阶段")
     return args
 
 
@@ -154,7 +167,9 @@ def execute(args):
                           node_mask_max_observed=4, energy_tolerance=1e-12)
         command = [METHOD_DIR / "scripts/train_gref.py", "--data-dir", data_dir,
                    "--output-dir", run_dir, "--device", args.device,
-                   "--skip-test-evaluation", "--no-terminal-progress"]
+                   "--skip-test-evaluation"]
+        if args.no_cuda_cache:
+            command.append("--no-cuda-cache")
         for name, value in config.items():
             command += ["--" + name.replace("_", "-"), str(value)]
         run_child(run_id, "train", command)

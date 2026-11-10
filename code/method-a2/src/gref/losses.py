@@ -32,9 +32,14 @@ def response_energy(
     observation: torch.Tensor, response: torch.Tensor, mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """在已经统一标准化的响应坐标中计算能量，不再次除以旧标准差。"""
+    weight = observation_mask(observation, mask)
+    return _masked_response_energy(observation, response, weight)
+
+
+def _masked_response_energy(observation, response, weight):
+    """用已经验证的完整掩码计算逐候选响应能量。"""
     if response.ndim != 5 or response.shape[0] != observation.shape[0] or response.shape[2:] != observation.shape[1:]:
         raise ValueError("响应必须为与观测对应的 [B,C,N,T,F]")
-    weight = observation_mask(observation, mask)
     difference = torch.where(weight[:, None].bool(), response - observation[:, None], 0.0)
     return difference.square().sum(dim=(2, 3, 4)) / weight.sum(dim=(1, 2, 3))[:, None]
 
@@ -145,7 +150,7 @@ def region_term_losses(
     candidate_mask: torch.Tensor, locations: torch.Tensor, kernel: torch.Tensor, *,
     rank_temperature: float, lambda_energy: float = 1.0, lambda_rank: float = 0.3,
     lambda_region: float = 0.1, beta_obs: float = 0.1, beta_miss: float = 0.4,
-    mask: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None, predicted_energy: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor | float | int]:
     """RaReF 区域概率损失：保留能量与排序项，以区域交叉熵替换图平滑项。
 
@@ -186,8 +191,8 @@ def region_term_losses(
 
     reconstruction = reconstruction_energy(response, target, weight)
     energy_numerator = (reconstruction * candidate).sum()
-    energy_denominator = float(candidate.sum().item())
-    energies = response_energy(observation, response, weight)
+    energy_denominator = candidate.sum()
+    energies = predicted_energy if predicted_energy is not None else response_energy(observation, response, weight)
     true_energies = response_energy(observation, target.detach(), weight)
     rank_numerator, rank_events = list_energy_loss(
         energies, true_energies, fault_mask, locations, rank_temperature
@@ -224,7 +229,7 @@ def region_term_losses(
         region_events = 0
         region_loss = region_numerator
 
-    energy = energy_numerator / max(energy_denominator, 1.0)
+    energy = energy_numerator / energy_denominator.clamp_min(1.0)
     rank = rank_numerator / rank_events if rank_events > 0 else rank_numerator * 0.0
     total = lambda_energy * energy + lambda_rank * rank + lambda_region * region_loss
     return {

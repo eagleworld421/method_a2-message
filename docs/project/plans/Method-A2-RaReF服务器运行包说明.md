@@ -1,4 +1,4 @@
-<!-- 摘要：提供 RaReF 双 IEEE37 数据服务器包的 README，集中列出 CUDA 12.8 环境安装、激活、检查，以及两套数据独立训练、验证、测试和完整流程命令，并说明产物与验证边界。 -->
+<!-- 摘要：提供 RaReF 双 IEEE37 数据服务器包的 README，列出 CUDA 12.8 环境安装和运行命令，说明 CUDA 训练加速、进度条、后台日志、产物与验证边界。 -->
 
 # RaReF 服务器运行包说明
 
@@ -6,14 +6,14 @@
 
 本包以 2026-11-10 最新报告选定的 `region-exp2-b40-s10-seed342` 配置为默认值，使用 RaReF 区域损失模式。能量、排序、区域权重分别为 1、0.141、0.194，β_obs=0.05、β_miss=0.4、σ=1.0，排序温度固定为 0.0040640985。默认训练 200 轮、批次 64、学习率 0.001、随机种子 342。配置存于 `code/method-a2/raref_config.json`，原始参考配置保存在 `docs/reference_config.json`。
 
-双数据集包 `raref-server-20261110-ab` 包含以下两套已登记的 IEEE37 完整数据，分别训练与评价，不自动混合：
+双数据集包 `raref-server-20261110-ab-perf` 包含以下两套已登记的 IEEE37 完整数据，分别训练与评价，不自动混合：
 
 - A：`s0-ieee37-r0p01-20-loguniform`，电阻 0.01–20 Ω，对数均匀抽样。
 - B：`s0-ieee37-r10-100-loguniform`，电阻 10–100 Ω，对数均匀抽样。
 
 每套均为 38 个节点、39 个候选、2736 条样本和 40 个故障事件族，约 1.2 GB。原始 S0 数据保持完整；S2 在训练及评价时施加节点掩码。包内未包含预训练权重，默认从头训练；无需 OpenDSS、Windows COM 或原始仓库。B 使用相同 RaReF 默认超参数，排序温度及诊断能量容差沿用 A 的固定标定值；不将其解释为已针对 B 优化或验证的配置。
 
-本次复制当前工作区实际文件，包含尚未提交的最新实现。`manifest.json` 记录来源提交、分支、工作区状态以及每个交付文件的 SHA-256；仅凭来源 Git 提交不能重建该快照。数据登记快照见 `docs/dataset_registry.md`。最新配置主要在验证集上确定，报告未证明其未观测单点定位已恢复，也未证明其跨种子测试性能稳定。
+`manifest.json` 记录来源提交、分支、工作区状态以及每个交付文件的 SHA-256。数据登记快照见 `docs/dataset_registry.md`。默认配置主要在验证集上确定，报告未证明其未观测单点定位已恢复，也未证明其跨种子测试性能稳定。
 
 ## 2. 环境安装
 
@@ -24,13 +24,13 @@
 将 `.tar.gz` 与对应 `.sha256` 文件上传到服务器的同一目录，在该目录执行：
 
 ```bash
-sha256sum -c raref-server-20261110-ab.tar.gz.sha256
-tar -xzf raref-server-20261110-ab.tar.gz
-cd raref-server-20261110-ab
+sha256sum -c raref-server-20261110-ab-perf.tar.gz.sha256
+tar -xzf raref-server-20261110-ab-perf.tar.gz
+cd raref-server-20261110-ab-perf
 nvidia-smi
 ```
 
-后续全部命令均从解压后的包根目录 `raref-server-20261110-ab/` 执行。
+后续全部命令均从解压后的包根目录 `raref-server-20261110-ab-perf/` 执行。
 
 ### 2.2 首次安装 CUDA 12.8 环境
 
@@ -115,6 +115,12 @@ bash run.sh all --dataset s0-ieee37-r10-100-loguniform --run-id raref-ieee37-b-a
 
 短程正式数据检查可以使用新的运行标识与 `--epochs 2`；显存不足时降低 `--batch-size 16`。改变批次会改变优化轨迹，须按新实验记录。随机种子可在训练或全流程入口通过 `--seed 343` 覆盖；该操作按种子重划事件族，固定排序温度不重新标定。不可把短程检查或新种子结果解释为默认 200 轮参考实验的复现。
 
+### 3.6 CUDA 性能与训练进度
+
+CUDA 训练使用融合 Adam。显存容量允许时，程序缓存由训练侧统计量标准化的训练和验证张量。默认 IEEE37 划分的缓存约为 1.0 GiB，是否启用依据启动时可用显存；显存共享或紧张时可用 `--no-cuda-cache` 保持逐批加载，实际状态记录于 `config.json` 的 `training_acceleration`。解码器复用各轴上的线性投影，损失复用已计算的候选能量。拆分运算及融合优化器会改变浮点舍入，训练轨迹可能与历史运行略有差异。
+
+`train`、`all` 和 `smoke` 会在终端及 `train.log` 显示进度条、全部训练批次完成比例、当前轮次、已用时间及 ETA。已用时间从训练脚本开始记录数据准备进度时起算。ETA 根据实测批次速率估算区间，计入每轮验证和保存，随运行更新。`all` 在训练结束后独立报告后续阶段。
+
 运行标识必须唯一；已有运行不覆盖。若只完成训练，可继续执行验证、测试。验证与测试不可重写训练种子；测试入口要求验证完成且模型、划分、标准化、区域核哈希保持一致。测试启动后写入独占标记，禁止再次调用测试或重新验证。若测试因外部故障中断，保留现场与日志，需人工核验后处理，不自动删除标记或重跑。当前不提供训练中断续训、多 GPU 或作业调度器脚本。
 
 后台运行示例：
@@ -122,6 +128,7 @@ bash run.sh all --dataset s0-ieee37-r10-100-loguniform --run-id raref-ieee37-b-a
 ```bash
 mkdir -p code/method-a2/logs
 nohup bash run.sh all --run-id raref-a-server-342 --device cuda > code/method-a2/logs/launch-342.log 2>&1 &
+tail -f code/method-a2/logs/launch-342.log
 ```
 
 ## 4. 输出与检查
@@ -136,7 +143,7 @@ nohup bash run.sh all --run-id raref-a-server-342 --device cuda > code/method-a2
 - `split.npz`、`normalization.npz`、`region_kernel.npz`：可复算的划分、标准化和区域核。
 - `metrics.json`、`region_metrics.json`、`predictions.npz`、`shortcut_audit.json`、`dataset_audit.json`：标准与 S2 测试结果、逐事件预测和审计。
 - `server_complete.json`：全部测试阶段成功完成的标记。存在 `server_test.started.json` 但没有完成标记表示测试尚未完整成功。
-- `code/method-a2/logs/<run-id>/`：`train.log`、`validate-region.log`、`test-standard.log`、`test-region.log` 和训练进度 JSONL。
+- `code/method-a2/logs/<run-id>/`：`train.log`、`validate-region.log`、`test-standard.log`、`test-region.log`、`progress.jsonl` 和 `progress.latest.json`。
 
 脚本运行时控制台显示阶段及日志位置；子进程完整输出保存在上述日志。测试阶段的概率温度由同一冻结模型在验证集确定，不依据测试结果调整。区域覆盖率应与区域大小一起报告；验证集上的样本内校准不等同于独立测试保证。S1 拓扑错误评价不在本包范围内。
 
@@ -145,7 +152,7 @@ nohup bash run.sh all --run-id raref-a-server-342 --device cuda > code/method-a2
 以下命令只适用于包含完整来源数据和最新实现的开发仓库。构建工具独立于服务器运行入口，归档生成到对应方法的 `output/`。
 
 ```text
-python code/method-a2/scripts/build_raref_server_bundle.py --source-root . --destination code/method-a2/output/raref-server-20261110-ab
+python code/method-a2/scripts/build_raref_server_bundle.py --source-root . --destination code/method-a2/output/raref-server-20261110-ab-perf
 python -m unittest discover -s code/method-a2/tests -p test_raref_server_bundle.py -v
 ```
 

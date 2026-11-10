@@ -2,9 +2,9 @@
 
 # 项目文档索引
 
-<!-- 摘要补充：登记 RaReF Linux NVIDIA 服务器运行包、两套 IEEE37 电阻数据选择、环境配置、训练验证测试和数据校验说明。 -->
+<!-- 摘要补充：登记 RaReF Linux NVIDIA 服务器运行包、两套 IEEE37 电阻数据选择、环境配置、CUDA 训练加速、进度条、训练验证测试和数据校验说明。 -->
 
-- `docs/project/plans/Method-A2-RaReF服务器运行包说明.md`：运行包 `docs/README.md` 的正文来源，集中列出 CUDA 12.8 环境安装、激活和检查、0.01–20 Ω 与 10–100 Ω 数据各自的训练、验证、测试及完整流程命令，并说明冻结测试约束与产物。触发关键词：RaReF、README、服务器、Linux、CUDA、环境配置、打包、数据选择、10–100、训练、验证、测试。
+- `docs/project/plans/Method-A2-RaReF服务器运行包说明.md`：运行包 `docs/README.md` 的正文来源，列出 CUDA 12.8 环境安装、两套 IEEE37 数据的训练与评价命令，并说明显存缓存、融合 Adam、训练进度与 ETA、冻结测试约束和产物。触发关键词：RaReF、README、服务器、Linux、CUDA、环境配置、打包、数据选择、10–100、训练性能、进度条、ETA、验证、测试。
 
 ## 检索顺序
 

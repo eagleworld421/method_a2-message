@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from ..model.marker_response_predictor import MarkerResponsePredictor
-from .losses import observation_mask, response_energy
+from .losses import _masked_response_energy, observation_mask
 
 
 class GrefPredictor(MarkerResponsePredictor):
@@ -29,8 +29,8 @@ class GrefPredictor(MarkerResponsePredictor):
         response_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """仅接收部署可见输入，真实响应、标签与分组不得进入前向。"""
-        mask = observation_mask(x_obs, response_mask)
-        if node_mask is not None:
+        mask = observation_mask(x_obs, response_mask if response_mask is not None else node_mask)
+        if node_mask is not None and response_mask is not None:
             mask = mask * observation_mask(x_obs, node_mask)
             mask = observation_mask(x_obs, mask)
         visible = torch.where(mask.bool(), x_obs, 0.0)
@@ -39,5 +39,5 @@ class GrefPredictor(MarkerResponsePredictor):
             candidate_markers=candidate_markers, candidate_types=candidate_types,
             candidate_mask=candidate_mask, node_mask=node_mask,
         )
-        output["candidate_score"] = response_energy(x_obs, output["response"], mask)
+        output["candidate_score"] = _masked_response_energy(x_obs, output["response"], mask)
         return output

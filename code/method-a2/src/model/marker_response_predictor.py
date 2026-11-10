@@ -267,22 +267,21 @@ class MarkerResponsePredictor(nn.Module):
         query = torch.bmm(candidate_markers, z)
 
         n_candidates = candidate_markers.shape[1]
-        pooled_expand = pooled.unsqueeze(1).unsqueeze(1).expand(
-            batch_size, n_candidates, self.n_nodes, -1
-        )
-        z_expand = z.unsqueeze(1).expand(batch_size, n_candidates, self.n_nodes, -1)
-        query_expand = query.unsqueeze(2).expand(-1, -1, self.n_nodes, -1)
-        marker_expand = candidate_markers.unsqueeze(-1)
-        type_expand = candidate_types.unsqueeze(2).expand(-1, -1, self.n_nodes, -1)
         score_input = torch.cat([
             query,
             pooled.unsqueeze(1).expand(-1, n_candidates, -1),
             candidate_types,
         ], dim=-1)
         candidate_score = self.score_head(score_input).squeeze(-1)
-        hidden = self.decoder_input(
-            torch.cat([z_expand, query_expand, pooled_expand, marker_expand, type_expand], dim=-1)
+        # 线性投影先在各自的轴上计算，再广播相加，避免构造大规模拼接张量。
+        node_weight, query_weight, pool_weight, marker_weight, type_weight = self.decoder_input.weight.split(
+            (self.shared_dim, self.shared_dim, self.pool_dim, 1, 1), dim=1
         )
+        node_context = nn.functional.linear(z, node_weight, self.decoder_input.bias)
+        event_context = nn.functional.linear(pooled, pool_weight)
+        candidate_context = nn.functional.linear(query, query_weight) + nn.functional.linear(candidate_types, type_weight)
+        hidden = (node_context[:, None] + (candidate_context + event_context[:, None])[:, :, None]
+                  + candidate_markers.unsqueeze(-1).to(node_context.dtype) * marker_weight.flatten().to(node_context.dtype))
         hidden = hidden.reshape(batch_size * n_candidates, self.n_nodes, -1)
         if edge_mask is None:
             decoder_edge_mask = torch.ones(

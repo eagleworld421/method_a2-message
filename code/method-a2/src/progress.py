@@ -55,19 +55,28 @@ class ProgressWriter:
             return
         percent = record.get("percent")
         percent_text = "--" if percent is None else f"{percent:6.2f}%"
+        filled = min(20, max(0, int((percent or 0) / 5)))
+        bar = "#" * filled + "-" * (20 - filled)
         eta = record.get("eta_s")
-        eta_text = "--" if eta is None else _format_seconds(float(eta))
+        if eta is None:
+            eta_text = "--"
+        elif eta == 0:
+            eta_text = "0.0s"
+        else:
+            eta_text = f"{_format_seconds(eta * 0.8)}–{_format_seconds(eta * 1.3)}"
         elapsed_text = _format_seconds(float(record.get("elapsed_s") or 0.0))
         total = record.get("total")
         total_text = "?" if total is None else str(total)
         text = (
-            f"\r[{record.get('stage', '')}] {percent_text} "
+            f"[{record.get('stage', '')}] [{bar}] {percent_text} "
             f"{record.get('done', 0)}/{total_text} "
-            f"已运行 {elapsed_text} ETA {eta_text}"
+            f"已用 {elapsed_text} ETA {eta_text} {record.get('note', '')}"
         )
-        print(text[:180].ljust(180), end="", file=sys.stdout, flush=True)
-        if record.get("kind") in {"stage_done", "end", "error"}:
-            print(file=sys.stdout, flush=True)
+        if sys.stdout.isatty():
+            end = "\n" if record.get("kind") in {"stage_done", "end", "error"} else ""
+            print("\r" + text[:160].ljust(160), end=end, flush=True)
+        else:
+            print(text.rstrip(), flush=True)
 
     def stage_start(self, stage: str, total: int | None) -> None:
         """写入阶段开始记录并清空该阶段的分类速率。"""
@@ -87,17 +96,17 @@ class ProgressWriter:
     ) -> None:
         """写入一次阶段进度，并按同类单元估计 ETA。"""
         now = time.perf_counter()
-        if not force and now - self._last_write < self.min_interval_s:
-            return
         if unit is not None and unit_seconds is not None:
             history = self._unit_totals.setdefault(unit, [0.0, 0])
             history[0] = float(history[0]) + float(unit_seconds)
             history[1] = int(history[1]) + 1
+        if not force and now - self._last_write < self.min_interval_s:
+            return
         rate = None
         if unit in self._unit_totals and self._unit_totals[unit][1]:
             rate = float(self._unit_totals[unit][0]) / int(self._unit_totals[unit][1])
         remaining = None if total is None else max(int(total) - int(done), 0)
-        eta = None if rate is None or remaining is None or remaining == 0 else rate * remaining
+        eta = 0.0 if remaining == 0 else (None if rate is None or remaining is None else rate * remaining)
         record = {
             "kind": kind,
             "utc": self._utc(),

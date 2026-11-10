@@ -20,6 +20,7 @@ from ..training.evaluation import rank_metrics, split_by_group
 from .data import (
     apply_edge_drop,
     build_undirected_edge_groups,
+    cache_cuda_batches,
     fit_normalization,
     load_arrays,
     make_batch,
@@ -71,7 +72,7 @@ def _losses(output, batch, args):
             rank_temperature=args.rank_temperature,
             lambda_energy=args.lambda_energy, lambda_rank=args.lambda_rank,
             lambda_region=args.lambda_region, beta_obs=args.beta_obs,
-            beta_miss=args.beta_miss, mask=batch["node_mask"],
+            beta_miss=args.beta_miss, mask=batch["node_mask"], predicted_energy=output["candidate_score"],
         )
     return gref_losses(output, batch["observation"], batch["target"],
                        batch["candidate_mask"], batch["location"],
@@ -120,7 +121,8 @@ def _strata(correct, values, metric="top1") -> list[dict]:
 
 
 @torch.no_grad()
-def evaluate(model, data, indices, normalization, args, progress=None, stage="validation", capture=False):
+def evaluate(model, data, indices, normalization, args, progress=None, stage="validation", capture=False,
+             batch_loader=None):
     """始终采用评价模式，以全局分母汇总损失，完整集合不受门控筛选。"""
     model.eval()
     term_keys = TERM_KEYS.get(getattr(args, "loss_mode", "gref"))
@@ -132,7 +134,8 @@ def evaluate(model, data, indices, normalization, args, progress=None, stage="va
     term_denominator = {name: 0.0 for name in (term_keys or ())}
     for start in range(0, len(indices), args.batch_size):
         chunk = indices[start:start + args.batch_size]
-        batch = make_batch(data, chunk, normalization, torch.device(args.device))
+        batch = (batch_loader(chunk) if batch_loader is not None
+                 else make_batch(data, chunk, normalization, torch.device(args.device)))
         output = _forward(model, batch)
         losses = _losses(output, batch, args)
         if term_mode:
@@ -437,10 +440,25 @@ def run(args: argparse.Namespace) -> Path:
         gate = audit_training(data, split["train_idx"], normalization, args, progress)
         _write_json(output_dir / "gate_audit.json", gate)
         progress.stage_done("audit", len(split["train_idx"]))
+        device = torch.device(args.device)
+        cuda_region = region_mode and device.type == "cuda"
+        batch_loader = None
+        if cuda_region and not getattr(args, "no_cuda_cache", False):
+            progress.stage_start("cuda_cache", None)
+            try:
+                batch_loader = cache_cuda_batches(
+                    data, np.concatenate((split["train_idx"], split["val_idx"])), normalization,
+                    device, args.batch_size,
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+            note = "已缓存训练和验证数据" if batch_loader is not None else "显存不足，逐批加载"
+            progress.stage_done("cuda_cache", None, note=note)
+        config["training_acceleration"] = {"cuda_cache": batch_loader is not None, "fused_adam": cuda_region}
         model_config = {"n_nodes": data["X_obs"].shape[1], "time_steps": data["X_obs"].shape[2],
                         "feature_dim": data["X_obs"].shape[3]}
         model = GrefPredictor(**model_config).to(args.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, fused=True if cuda_region else None)
         rng = np.random.default_rng(args.seed)
         edge_drop_rng = np.random.default_rng(args.seed + 1)
         mask_rng = np.random.default_rng(args.seed + 2)
@@ -450,24 +468,28 @@ def run(args: argparse.Namespace) -> Path:
         save_epochs = {
             int(item) for item in str(getattr(args, "save_epochs", "")).split(",") if item.strip()
         }
+        batch_count = math.ceil(len(split["train_idx"]) / args.batch_size)
+        training_steps = args.epochs * batch_count
+        progress.stage_start("training", training_steps)
         for epoch in range(1, args.epochs + 1):
             model.train()
             order = rng.permutation(split["train_idx"])
-            batch_count = math.ceil(len(order) / args.batch_size)
-            progress.stage_start("training", batch_count)
-            total_sum = 0.0
-            term_sum = {name: 0.0 for name in term_keys}
+            batch_losses = []
+            batch_sizes = []
+            epoch_note = f"epoch {epoch}/{args.epochs}"
             mask_counts = {"full": 0, "partial_observed": 0, "partial_missing": 0,
                            "partial_normal": 0}
             for start in range(0, len(order), args.batch_size):
                 started = time.perf_counter()
-                batch = make_batch(data, order[start:start + args.batch_size], normalization, torch.device(args.device))
+                rows = order[start:start + args.batch_size]
+                batch = (batch_loader(rows) if batch_loader is not None
+                         else make_batch(data, rows, normalization, device))
                 if edge_drop_prob > 0.0:
                     apply_edge_drop(
                         batch, edge_groups, edge_drop_prob, edge_drop_max, edge_drop_rng
                     )
                 if region_mode:
-                    locations = batch["location"].detach().cpu().numpy()
+                    locations = data["y_loc"][rows]
                     masks = sample_node_masks(
                         locations, n_fault, mask_rng,
                         full_probability=args.node_mask_full_probability,
@@ -491,20 +513,20 @@ def run(args: argparse.Namespace) -> Path:
                     raise FloatingPointError("训练损失出现非有限值")
                 losses["total"].backward()
                 optimizer.step()
-                total_sum += float(losses["total"].detach()) * len(batch["location"])
-                if term_mode:
-                    for name in term_keys:
-                        term_sum[name] += float(losses[name].detach()) * len(batch["location"])
-                progress.update("training", "batch", start // args.batch_size + 1, batch_count,
-                                note=f"epoch={epoch}/{args.epochs}", unit_seconds=time.perf_counter() - started)
-            progress.stage_done("training", batch_count)
-            progress.stage_start("validation", len(split["val_idx"]))
-            validation, _ = evaluate(model, data, split["val_idx"], normalization, args, progress)
-            progress.stage_done("validation", len(split["val_idx"]))
+                batch_losses.append(torch.stack([losses[name].detach() for name in ("total", *term_keys)]))
+                batch_sizes.append(len(rows))
+                batch_number = start // args.batch_size + 1
+                if batch_number < batch_count:
+                    # 首批包含设备和算子预热，外推时只使用随后的计时。
+                    seconds = time.perf_counter() - started if epoch > 1 or batch_number > 1 else None
+                    progress.update("training", "batch", (epoch - 1) * batch_count + batch_number,
+                                    training_steps, note=epoch_note, unit_seconds=seconds)
+            means = np.average(torch.stack(batch_losses).cpu().numpy(), axis=0, weights=batch_sizes)
+            validation, _ = evaluate(model, data, split["val_idx"], normalization, args, batch_loader=batch_loader)
             if term_mode:
                 record = {
-                    "epoch": epoch, "train_batch_total_mean": total_sum / len(order),
-                    **{f"train_{name}_mean": term_sum[name] / len(order) for name in term_keys},
+                    "epoch": epoch, "train_batch_total_mean": means[0],
+                    **{f"train_{name}_mean": mean for name, mean in zip(term_keys, means[1:])},
                     "val_top1": validation["score"]["top1"], "val_top3": validation["score"]["top3"],
                     **{f"val_{name}": validation["losses"][name] for name in term_keys},
                     "val_total": validation["losses"]["total"],
@@ -519,7 +541,7 @@ def run(args: argparse.Namespace) -> Path:
                     })
                 key = (record["val_top1"], -record["val_energy"])
             else:
-                record = {"epoch": epoch, "train_batch_total_mean": total_sum / len(order),
+                record = {"epoch": epoch, "train_batch_total_mean": means[0],
                           "val_top1": validation["score"]["top1"], "val_top3": validation["score"]["top3"],
                           "val_family": validation["losses"]["family"], "val_loc": validation["losses"]["loc"],
                           "val_gate_coverage": validation["gate_coverage"]}
@@ -542,9 +564,14 @@ def run(args: argparse.Namespace) -> Path:
                             "epoch": epoch, "loss_mode": args.loss_mode,
                             "rank_temperature": args.rank_temperature},
                            output_dir / f"checkpoint-epoch{epoch:03d}.pt")
+            # 末批的计时含当轮验证与保存，剩余时间覆盖后续训练轮的这些开销。
+            progress.update("training", "batch", epoch * batch_count, training_steps, note=epoch_note,
+                            unit_seconds=time.perf_counter() - started, force=epoch == args.epochs,
+                            kind="stage_done" if epoch == args.epochs else "unit")
         checkpoint = torch.load(output_dir / "model.pt", map_location=args.device, weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
-        validation, _ = evaluate(model, data, split["val_idx"], normalization, args)
+        validation, _ = evaluate(model, data, split["val_idx"], normalization, args, batch_loader=batch_loader)
+        del batch_loader
         dataset_audit = {
             "split_groups": {key: split[key].tolist() for key in ("train_groups", "val_groups", "test_groups")},
             "n_train": len(split["train_idx"]), "n_val": len(split["val_idx"]), "n_test": len(split["test_idx"]),
@@ -687,4 +714,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--skip-test-evaluation", action="store_true",
                         help="扫描模式：训练后跳过测试集评价，只写验证集产物")
     parser.add_argument("--no-terminal-progress", action="store_true")
+    parser.add_argument("--no-cuda-cache", action="store_true",
+                        help="逐批从主存加载，不在显存中缓存已标准化的训练和验证数据")
     return parser.parse_args(argv)

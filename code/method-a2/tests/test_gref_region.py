@@ -1,6 +1,7 @@
 """RaReF 区域概率损失与节点缺测增强的数值、对齐、梯度与端到端契约测试。"""
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -13,8 +14,9 @@ if str(METHOD_DIR) not in sys.path:
     sys.path.insert(0, str(METHOD_DIR))
 
 from src.gref import training
-from src.gref.data import sample_node_masks
+from src.gref.data import cache_cuda_batches, fit_normalization, load_arrays, make_batch, sample_node_masks
 from src.gref.losses import region_term_losses, three_term_losses
+from src.gref.model import GrefPredictor
 from src.gref.region import (
     calibrate_temperature,
     graph_distance_hops,
@@ -277,3 +279,58 @@ def test_region_end_to_end_smoke(tmp_path, monkeypatch):
     with (output / "train_log.csv").open(encoding="utf-8") as handle:
         rows = handle.read().strip().splitlines()[1:]
     assert rows, "训练日志为空"
+    progress_file = tmp_path / "logs/region-smoke/progress.jsonl"
+    records = [json.loads(line) for line in progress_file.read_text(encoding="utf-8").splitlines()]
+    train_progress = [record for record in records if record["stage"] == "training"]
+    assert [record["kind"] for record in train_progress].count("start") == 1
+    with np.load(output / "split.npz") as split:
+        assert train_progress[-1]["total"] == 2 * math.ceil(len(split["train_idx"]) / args.batch_size)
+    assert train_progress[-1]["percent"] == 100.0 and train_progress[-1]["eta_s"] == 0
+
+
+def test_batch_cache_matches_uncached_batches(tmp_path, monkeypatch):
+    """在主存模拟显存缓存，检验乱序、缺席行、掩码副本和低显存回退。"""
+    _dataset(tmp_path / "data")
+    data = load_arrays(tmp_path / "data")
+    rows = np.array([9, 0, 1, 7])
+    normalization = fit_normalization(data, rows[:3])
+    device = torch.device("cpu")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (1024**3, 1024**3))
+    assert cache_cuda_batches(data, rows, normalization, device, 3) is None
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (4 * 1024**3, 4 * 1024**3))
+    loader = cache_cuda_batches(data, rows, normalization, device, 3)
+    expected = make_batch(data, rows[::-1], normalization, device)
+    actual = loader(rows[::-1])
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+    actual["node_mask"].zero_()
+    torch.testing.assert_close(loader(rows[::-1])["node_mask"], expected["node_mask"])
+    with pytest.raises(ValueError, match="缓存之外"):
+        loader(np.array([2]))
+
+
+@pytest.mark.parametrize("pooling", ["mean", "mean_median_concat"])
+def test_split_decoder_projection_matches_dense_forward_and_gradient(pooling):
+    """以原拼接公式校验前向和投影参数梯度，覆盖不同的池化维度。"""
+    torch.manual_seed(14)
+    model = GrefPredictor(3, 2, 1, pooling=pooling).eval()
+    observation = torch.randn(2, 3, 2, 1)
+    edge_index = torch.tensor([[0, 1], [1, 0]])
+    actual = []
+    hook = model.decoder_layers[0].register_forward_pre_hook(lambda _, inputs: actual.append(inputs[0]))
+    output = model(observation, edge_index, torch.ones(2, 5))
+    hook.remove()
+    z, pooled = output["Z"], output["z_shared"]
+    markers, types = output["candidate_markers"], output["candidate_types"]
+    query = markers @ z
+    dense_input = torch.cat([
+        z[:, None].expand(-1, 4, -1, -1), query[:, :, None].expand(-1, -1, 3, -1),
+        pooled[:, None, None].expand(-1, 4, 3, -1), markers.unsqueeze(-1),
+        types[:, :, None].expand(-1, -1, 3, -1),
+    ], dim=-1)
+    expected = model.decoder_input(dense_input).reshape_as(actual[0])
+    torch.testing.assert_close(actual[0], expected, rtol=1e-5, atol=1e-6)
+    params = (model.decoder_input.weight, model.decoder_input.bias)
+    for result, reference in zip(torch.autograd.grad(actual[0].square().sum(), params, retain_graph=True),
+                                 torch.autograd.grad(expected.square().sum(), params)):
+        torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-5)

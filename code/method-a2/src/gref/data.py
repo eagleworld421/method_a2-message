@@ -132,6 +132,38 @@ def make_batch(
     return batch
 
 
+def cache_cuda_batches(data, indices, normalization, device, batch_size):
+    """分块缓存已标准化的训练和验证张量，显存不足时由调用方沿用逐批加载。"""
+    fields = ("observation", "target", "node_mask", "candidate_mask", "edge_mask", "location")
+    n_rows = len(indices)
+    bytes_per_row = 4 * (data["X_obs"][0].size + data["signature_bank"][0].size)
+    bytes_per_row += sum(data[key][0].nbytes for key in ("mask", "candidate_mask", "edge_mask", "y_loc"))
+    free_bytes, _ = torch.cuda.mem_get_info(device.index)
+    if n_rows * bytes_per_row > min(free_bytes // 3, free_bytes - 2 * 1024**3):
+        return None
+
+    row_lookup = np.full(len(data["y_loc"]), -1, dtype=np.int64)
+    row_lookup[indices] = np.arange(n_rows)
+    cache = {}
+    for start in range(0, n_rows, batch_size):
+        batch = make_batch(data, indices[start:start + batch_size], normalization, device)
+        if not cache:
+            cache = {key: batch[key].new_empty((n_rows, *batch[key].shape[1:])) for key in fields}
+            graph = {key: batch[key] for key in ("edge_index", "edge_attr")}
+        for key in fields:
+            cache[key][start:start + len(batch["location"])].copy_(batch[key])
+
+    def load_batch(rows):
+        """按原始数据索引从显存读取独立批次。"""
+        slots = row_lookup[rows]
+        if (slots < 0).any():
+            raise ValueError("批次包含显存缓存之外的样本")
+        index = torch.as_tensor(slots, device=device)
+        return {**graph, **{key: tensor.index_select(0, index) for key, tensor in cache.items()}}
+
+    return load_batch
+
+
 def sample_node_masks(
     locations: np.ndarray, n_nodes: int, rng: np.random.Generator, *,
     full_probability: float = 0.25, min_observed: int = 15, max_observed: int = 37,

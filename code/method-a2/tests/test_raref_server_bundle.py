@@ -128,6 +128,8 @@ class BundleTests(unittest.TestCase):
             """模拟训练落盘，核对实际命令中的数据路径。"""
             self.assertEqual(label, "train")
             self.assertEqual(Path(command[command.index("--data-dir") + 1]).name, high)
+            self.assertIn("--no-cuda-cache", command)
+            self.assertNotIn("--no-terminal-progress", command)
             for name in ("model.pt", "normalization.npz", "split.npz", "region_kernel.npz"):
                 self.put(run / name, "frozen")
             self.put(run / "config.json", json.dumps({"loss_mode": "region", "batch_size": 64, "seed": 342}))
@@ -136,7 +138,8 @@ class BundleTests(unittest.TestCase):
                 patch.object(runner, "verify_bundle", return_value={"dataset": builder.DATASET, "datasets": builder.DATASETS}), \
                 patch.object(runner, "check_environment", return_value={}), \
                 patch.object(runner, "run_child", side_effect=fake_train):
-            runner.execute(runner.parse_args(["train", "--run-id", "high-run", "--dataset", high, "--device", "cpu"]))
+            runner.execute(runner.parse_args(["train", "--run-id", "high-run", "--dataset", high,
+                                              "--device", "cpu", "--no-cuda-cache"]))
         state = json.loads((run / "server_run.json").read_text(encoding="utf-8"))
         self.assertEqual(state["data_dir"], "data/" + high)
 

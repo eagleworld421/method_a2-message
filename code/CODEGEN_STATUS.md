@@ -2,13 +2,14 @@
 
 # 代码生成状态
 
-<!-- 摘要补充：新增 RaReF 独立服务器包构建与训练、验证、冻结测试入口及契约验证，支持两套 IEEE37 电阻数据的独立选择。 -->
+<!-- 摘要补充：记录 RaReF 独立服务器包、双 IEEE37 数据选择、CUDA 训练加速、训练进度与 ETA，以及验证和冻结测试入口。 -->
 
 ## RaReF 服务器交付工具（2026-11-10）
 
 - `method-a2/scripts/build_raref_server_bundle.py` 从指定来源工作区复制 RaReF 最小依赖闭包、已登记 IEEE37 A（0.01–20 Ω）与 B（10–100 Ω）两套完整数据及配置，生成含文件摘要的独立目录、压缩归档与归档摘要，拒绝任一数据元信息不一致和覆盖已有交付。
 - `method-a2/scripts/run_raref_server.py` 提供环境检查、合成冒烟、训练、验证、冻结测试与完整流程入口；复用既有模型和评价实现，训练后仅用验证集选模及标定概率温度，测试保留独占启动标记。
-- 运行入口通过 `--dataset` 选择数据，验证与测试固定使用训练记录的数据目录。契约验证入口为 `method-a2/tests/test_raref_server_bundle.py`；双数据集交付位于来源方法的 `output/raref-server-20261110-ab/`，原单数据集包保留。安装和验证边界见 `docs/project/plans/Method-A2-RaReF服务器运行包说明.md`。
+- 运行入口通过 `--dataset` 选择数据，验证与测试固定使用训练记录的数据目录。契约验证入口为 `method-a2/tests/test_raref_server_bundle.py`；双数据集性能优化包位于来源方法的 `output/raref-server-20261110-ab-perf/`。安装和验证边界见 `docs/project/plans/Method-A2-RaReF服务器运行包说明.md`。
+- CUDA 区域损失训练启用融合 Adam，按可用显存缓存已标准化的训练与验证张量。解码器沿节点、候选和事件轴分别投影，区域损失复用前向候选能量。训练入口将跨轮次进度、已用时间和预计剩余时间同时写入控制台与日志。
 
 ## 总体状态
 
