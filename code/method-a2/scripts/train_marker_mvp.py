@@ -122,6 +122,7 @@ def _evaluate_split(
     candidate_mask: np.ndarray,
     n_fault_candidates: int,
     scale: np.ndarray,
+    lambda_loc: float,
     lambda_rank: float,
     lambda_response: float,
     rank_margin: float,
@@ -140,6 +141,7 @@ def _evaluate_split(
         losses = compute_marker_losses(
             output, batch["observation"], batch["target"], batch["candidate_mask"],
             batch["fault_mask"], batch["location"],
+            lambda_loc=lambda_loc,
             lambda_rank=lambda_rank, lambda_response=lambda_response,
             rank_margin=rank_margin,
             rank_temperature=rank_temperature,
@@ -256,8 +258,12 @@ def _save_predictions(
     np.savez_compressed(path, **payload)
 
 
-def run(args: argparse.Namespace) -> Path:
-    """执行训练与评价并返回产物目录。"""
+def run(args: argparse.Namespace, progress: ProgressWriter | None = None) -> Path:
+    """执行训练与评价并返回产物目录。
+
+    `progress` 供调用方（如 `main.py` 运行入口）注入自定义进度显示方式，为 None
+    时按 `args` 构造默认的进度写入器。
+    """
     _set_seed(args.seed)
     data = load_dataset(args.data_dir)
     meta = data["meta"]
@@ -268,7 +274,8 @@ def run(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     run_id = args.run_id or f"train-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-seed{args.seed}"
     progress_path = args.progress or (METHOD_DIR / "logs" / run_id / "progress.jsonl")
-    progress = ProgressWriter(progress_path, run_id, terminal=not args.no_terminal_progress)
+    if progress is None:
+        progress = ProgressWriter(progress_path, run_id, terminal=not args.no_terminal_progress)
 
     candidate_mask = data["candidate_mask"]
     scaler = np.load(Path(args.data_dir) / meta.get("feature_scaler", "feature_scaler.npz"))
@@ -325,6 +332,7 @@ def run(args: argparse.Namespace) -> Path:
                 values = train_step(
                     model, optimizer,
                     _batch(data, indices, device, candidate_mask, n_fault_candidates),
+                    lambda_loc=args.lambda_loc,
                     lambda_rank=args.lambda_rank,
                     lambda_response=args.lambda_response,
                     rank_margin=args.rank_margin,
@@ -346,7 +354,7 @@ def run(args: argparse.Namespace) -> Path:
             started = time.perf_counter()
             validation = _evaluate_split(
                 model, data, val_idx, device, candidate_mask, n_fault_candidates,
-                scale, args.lambda_rank, args.lambda_response, args.rank_margin,
+                scale, args.lambda_loc, args.lambda_rank, args.lambda_response, args.rank_margin,
                 args.rank_temperature,
                 args.uncertainty_weight, args.logvar_clamp,
             )
@@ -386,7 +394,7 @@ def run(args: argparse.Namespace) -> Path:
         started = time.perf_counter()
         validation = _evaluate_split(
             model, data, val_idx, device, candidate_mask, n_fault_candidates,
-            scale, args.lambda_rank, args.lambda_response, args.rank_margin,
+            scale, args.lambda_loc, args.lambda_rank, args.lambda_response, args.rank_margin,
             args.rank_temperature,
             args.uncertainty_weight, args.logvar_clamp,
         )
@@ -395,7 +403,7 @@ def run(args: argparse.Namespace) -> Path:
         started = time.perf_counter()
         test = _evaluate_split(
             model, data, test_idx, device, candidate_mask, n_fault_candidates,
-            scale, args.lambda_rank, args.lambda_response, args.rank_margin,
+            scale, args.lambda_loc, args.lambda_rank, args.lambda_response, args.rank_margin,
             args.rank_temperature,
             args.uncertainty_weight, args.logvar_clamp,
         )
@@ -497,6 +505,25 @@ def run(args: argparse.Namespace) -> Path:
         raise
 
     progress.stage_start("writeout", 1)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": {
+                "n_nodes": n_nodes,
+                "time_steps": int(meta["window_len"]),
+                "feature_dim": int(meta["feature_dim"]),
+                "pooling": args.pooling,
+                "temporal_mode": args.temporal_mode,
+                "derived_channels": args.derived_channels,
+                "uncertainty": args.uncertainty,
+                "logvar_clamp": args.logvar_clamp,
+                "temporal_layers": args.temporal_layers,
+                "encoder_layers": args.encoder_layers,
+            },
+            "best_epoch": int(max(history, key=lambda row: (row["val_top1"] or 0.0, -(row["val_family"] or 0.0)))["epoch"]),
+        },
+        output_dir / "model.pt",
+    )
     forward_test = _forward_all(
         model, data, test_idx, device, candidate_mask, n_fault_candidates
     )
@@ -626,6 +653,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-batches", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--lambda-loc", type=float, default=1.0)
     parser.add_argument("--lambda-rank", type=float, default=0.1)
     parser.add_argument("--lambda-response", type=float, default=0.1)
     parser.add_argument("--rank-margin", type=float, default=0.1)

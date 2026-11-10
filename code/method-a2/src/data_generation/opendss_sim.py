@@ -107,7 +107,12 @@ class FaultConfig:
 
 
 class FaultSimulator:
-    """驱动 OpenDSS IEEE 测试馈线并读取六维母线电压相量。"""
+    """驱动 OpenDSS IEEE 测试馈线并读取六维母线电压相量。
+
+    母线与候选轴不包含电源母线：电源母线由理想电压源固定，其电压不随故障位置变化，
+    保留在候选轴里会让「故障发生在电源母线」这类物理上不成立的样本进入数据，并使
+    该候选与无故障候选几乎重合。剔除逻辑见 `exclude_source_buses`。
+    """
 
     def __init__(self, case_name: str = "ieee13"):
         if case_name not in _DSS_CASES:
@@ -124,6 +129,42 @@ class FaultSimulator:
         self.line_params = {}
         self._topology_loaded = False
         self._com_initialized = False
+        self.excluded_bus_names: list[str] = []
+        """被剔除出母线与候选轴的电源母线名，供数据元信息留档。"""
+
+    @staticmethod
+    def exclude_source_buses(all_names, source_buses) -> tuple[list[str], list[str]]:
+        """从母线序列中剔除电源母线，返回（保留列表，剔除列表）。
+
+        比较时统一转小写并去除相别后缀，避免 OpenDSS 返回的大小写差异影响判断。
+        """
+        source = {
+            str(name).split(".")[0].strip().lower() for name in source_buses
+        }
+        kept = [
+            name for name in all_names
+            if str(name).split(".")[0].strip().lower() not in source
+        ]
+        dropped = [
+            name for name in all_names
+            if str(name).split(".")[0].strip().lower() in source
+        ]
+        return kept, dropped
+
+    def _read_source_buses(self) -> set[str]:
+        """读取全部电压源元件连接的母线名。"""
+        circuit = self._dss.ActiveCircuit
+        names: set[str] = set()
+        collection = circuit.Vsources
+        index = collection.First
+        while index > 0:
+            circuit.SetActiveElement(f"Vsource.{collection.Name}")
+            for bus in circuit.ActiveCktElement.BusNames:
+                main = str(bus).split(".")[0].strip().lower()
+                if main:
+                    names.add(main)
+            index = collection.Next
+        return names
 
     def close(self) -> None:
         """释放 OpenDSS 电路与 COM 引用。"""
@@ -156,7 +197,7 @@ class FaultSimulator:
         params = {}
         self._bus_name_to_idx = {
             name.strip().lower(): idx
-            for idx, name in enumerate(dss.ActiveCircuit.AllBusNames)
+            for idx, name in enumerate(self._bus_names)
         }
         i = dss.ActiveCircuit.Lines.First
         while i > 0:
@@ -229,7 +270,15 @@ class FaultSimulator:
                         dss.ActiveCircuit.Loads.kvar = kvar * mult
                     i = dss.ActiveCircuit.Loads.Next
             dss.ActiveCircuit.Solution.Solve()
-            self._bus_names = list(dss.ActiveCircuit.AllBusNames)
+            # 电源母线由理想电压源钳位，其电压不随故障位置变化，因此从母线与候选轴
+            # 中剔除；若剔除后为空（异常算例），退回全部母线以免生成空数据集。
+            kept, dropped = self.exclude_source_buses(
+                list(dss.ActiveCircuit.AllBusNames), self._read_source_buses()
+            )
+            if not kept:
+                kept, dropped = list(dss.ActiveCircuit.AllBusNames), []
+            self._bus_names = kept
+            self.excluded_bus_names = dropped
             self._n_nodes = len(self._bus_names)
             self._bus_phase_nodes = self._read_bus_phase_nodes()
             self._node_counts = [len(nodes) for nodes in self._bus_phase_nodes]
@@ -240,7 +289,8 @@ class FaultSimulator:
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"OpenDSS 基态求解失败：case={self.case_name}, path={self._master_path}"
+                f"OpenDSS 基态求解失败：case={self.case_name}, path={self._master_path}；"
+                f"底层异常 {type(exc).__name__}: {exc}"
             ) from exc
 
     def _read_node_counts(self) -> list:
@@ -250,7 +300,7 @@ class FaultSimulator:
     def _read_bus_phase_nodes(self) -> list[tuple[int, ...]]:
         """读取每个母线实际存在的一至三相节点编号。"""
         phases = []
-        for name in self._dss.ActiveCircuit.AllBusNames:
+        for name in self._bus_names:
             self._dss.ActiveCircuit.SetActiveBus(name)
             nodes = tuple(
                 int(node)
@@ -296,7 +346,8 @@ class FaultSimulator:
         except Exception as exc:
             raise RuntimeError(
                 f"OpenDSS 故障求解失败：case={self.case_name}, "
-                f"bus={config.fault_bus}, class={config.fault_class}, z={config.z_fault}"
+                f"bus={config.fault_bus}, class={config.fault_class}, z={config.z_fault}；"
+                f"底层异常 {type(exc).__name__}: {exc}"
             ) from exc
 
     def _read_voltages(self) -> np.ndarray:
@@ -317,7 +368,8 @@ class FaultSimulator:
             return out
         except Exception as exc:
             raise RuntimeError(
-                f"OpenDSS 电压读取失败：case={self.case_name}, bus_count={self._n_nodes}"
+                f"OpenDSS 电压读取失败：case={self.case_name}, bus_count={self._n_nodes}；"
+                f"底层异常 {type(exc).__name__}: {exc}"
             ) from exc
 
     def generate_scenario(self, config: FaultConfig) -> dict:

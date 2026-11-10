@@ -20,6 +20,7 @@ def compute_marker_losses(
     candidate_mask: torch.Tensor,
     fault_mask: torch.Tensor,
     location: torch.Tensor | None = None,
+    lambda_loc: float = 1.0,
     lambda_rank: float = 0.1,
     lambda_response: float = 0.1,
     rank_margin: float = 0.1,
@@ -47,7 +48,7 @@ def compute_marker_losses(
         model_output["candidate_score"], location, fault_mask,
         margin=rank_margin, temperature=rank_temperature,
     )
-    total = location_loss + lambda_rank * ranking + lambda_response * family
+    total = lambda_loc * location_loss + lambda_rank * ranking + lambda_response * family
     if "response_logvar" in model_output:
         total = total * float(uncertainty_weight)
     return {
@@ -63,6 +64,7 @@ def train_step(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     batch: dict[str, torch.Tensor],
+    lambda_loc: float = 1.0,
     lambda_rank: float = 0.1,
     lambda_response: float = 0.1,
     rank_margin: float = 0.1,
@@ -82,6 +84,7 @@ def train_step(
     losses = compute_marker_losses(
         output, batch["observation"], batch["target"], batch["candidate_mask"],
         batch["fault_mask"], batch.get("location"),
+        lambda_loc=lambda_loc,
         lambda_rank=lambda_rank, lambda_response=lambda_response,
         rank_margin=rank_margin,
         rank_temperature=rank_temperature,

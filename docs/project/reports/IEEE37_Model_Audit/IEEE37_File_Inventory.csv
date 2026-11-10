@@ -1,0 +1,5 @@
+﻿File,Bytes,SHA256,Modified,ReferencedByDSS,Origin
+ieee37.dss,7427,97c2571c1698be56c164d3b4c3a1c7a536df976631d3dba4d5108b8b44498b81,2021-11-16T05:25:22,master,provided extraction / byte-identical canonical case
+IEEELineCodes.DSS,11852,855910b3757efb1084c8310747a3459881cc135bd773665cdd6db16ff9b50ae1,2023-04-20T12:36:32,yes,provided extraction / byte-identical canonical case
+IEEE37_BusXY.csv,755,e1af4a2e8667938db07ad8bd5704605d77bfea70678ecf89b255b2405f65afce,2021-02-03T18:25:48,yes,provided extraction / byte-identical canonical case
+ieee37_EXP_METERS.CSV,1793,e94e0cb7a425ed17314d901fdb3534b473fe0f8026fdc8ca5257139f460ad2a2,2020-07-20T09:11:30,no (auxiliary meter export),C:\Program Files\OpenDSS\IEEETestCases\37Bus\ieee37_EXP_METERS.CSV

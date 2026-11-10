@@ -1,0 +1,13 @@
+﻿Check,Result,Detail
+Connected components (bus level),1,"701,702,703,704,705,706,707,708,709,710,711,712,713,714,718,720,722,724,725,727,728,729,730,731,732,733,734,735,736,737,738,740,741,742,744,775,799,799r,sourcebus"
+Cycle rank (multi-edge bus graph),2,E - V + C
+Feeder tree (L1–L35 only),yes,"36 nodes, 35 edges"
+Simple cycles in feeder,0,[]
+Parallel edge groups,1,"('799', '799r'): ['Jumper', 'reg1a', 'reg1c']"
+Duplicate line definitions,0,[]
+Isolated buses,0,
+Leaves (excluding SourceBus),15,"712,718,722,724,725,728,729,731,732,735,736,740,741,742,775"
+Branch points (degree ≥ 3),14,"702,703,704,705,707,708,709,710,711,720,734,744,799,799r"
+Main feeder path,741,799r → 701 → 702 → 703 → 730 → 709 → 708 → 733 → 734 → 737 → 738 → 711 → 741 (7.970 mi)
+Phase-node graph components,1,121 nodes (incl. 4 transformer device nodes); sizes [121]
+Phase connection errors,0,none

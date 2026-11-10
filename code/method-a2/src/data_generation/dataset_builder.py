@@ -16,7 +16,7 @@ from .opendss_sim import (
     FaultSimulator,
     enumerate_fault_specs,
 )
-from .topology import build_observation_mask
+from .topology import build_edge_universe, build_observation_mask, validate_edge_masks
 from .waveform import build_dynamic_window
 from ..progress import ProgressWriter
 
@@ -37,6 +37,7 @@ def _sample_event(
     res_max: float,
     min_feasible_buses: int = 3,
     fault_classes: tuple[int, ...] = (0,),
+    impedance_sampling: str = "uniform",
 ) -> EventConfig:
     """采样一组供同一反事实族共享的事件参数。
 
@@ -59,9 +60,17 @@ def _sample_event(
         raise RuntimeError(
             f"故障类型 {fault_classes} 在当前拓扑上没有满足最小可行母线数的选项"
         )
+    if impedance_sampling == "uniform":
+        z_fault = rng.uniform(res_min, res_max)
+    elif impedance_sampling == "log_uniform":
+        if res_min <= 0 or res_max <= 0:
+            raise ValueError("对数均匀采样要求阻抗上下界均为正数")
+        z_fault = np.exp(rng.uniform(np.log(res_min), np.log(res_max)))
+    else:
+        raise ValueError(f"未知阻抗采样方式：{impedance_sampling}")
     return EventConfig(
         fault_class=int(rng.choice(feasible_classes)),
-        z_fault=float(rng.uniform(res_min, res_max)),
+        z_fault=float(z_fault),
         load_multipliers={
             name: float(rng.uniform(0.8, 1.2))
             for name in (simulator._base_loads or {})
@@ -167,6 +176,7 @@ def build_dataset(
     post_cycles: float = 2.0,
     res_min: float = 0.1,
     res_max: float = 100.0,
+    impedance_sampling: str = "uniform",
     normal_ratio: float = 1.0,
     seed: int = 42,
     s0_only: bool = True,
@@ -175,6 +185,10 @@ def build_dataset(
     fault_classes: tuple[int, ...] = (0,),
     hard_pairs: set[tuple[int, int]] | None = None,
     hard_pair_max_attempts: int = 12,
+    universe_extra_edges: np.ndarray | None = None,
+    universe_extra_edge_attr: np.ndarray | None = None,
+    universe_extra_edge_type: np.ndarray | None = None,
+    universe_extra_attr_source: np.ndarray | None = None,
     progress: ProgressWriter | None = None,
 ) -> dict:
     """生成 S0 数据集并写入数组与元数据文件。
@@ -202,6 +216,16 @@ def build_dataset(
     if n_nodes <= 0:
         raise RuntimeError("OpenDSS 未返回任何母线")
     edge_index, edge_attr = _edge_arrays(simulator)
+    edge_universe = build_edge_universe(
+        edge_index, edge_attr,
+        extra_edges=universe_extra_edges,
+        extra_edge_attr=universe_extra_edge_attr,
+        extra_edge_type=universe_extra_edge_type,
+        extra_attr_source=universe_extra_attr_source,
+    )
+    edge_index_universe = edge_universe["edge_index_universe"]
+    edge_attr_universe = edge_universe["edge_attr_universe"]
+    edge_mask_true_row = edge_universe["edge_mask_true"]
     n_fault = n_nodes * samples_per_bus
     n_normal = max(1, int(round(n_fault * normal_ratio)))
     total = n_fault + n_normal
@@ -224,7 +248,8 @@ def build_dataset(
         started = time.perf_counter()
         for attempt in range(hard_pair_max_attempts if hard_pairs else 1):
             event = _sample_event(
-                rng, simulator, res_min, res_max, fault_classes=fault_classes
+                rng, simulator, res_min, res_max, fault_classes=fault_classes,
+                impedance_sampling=impedance_sampling,
             )
             candidate_seed = int(rng.integers(0, 2**31 - 1))
             bank, feasible, phase_usage = generate_signature_bank(
@@ -271,7 +296,8 @@ def build_dataset(
 
     for _ in range(n_normal):
         event = _sample_event(
-            rng, simulator, res_min, res_max, fault_classes=fault_classes
+            rng, simulator, res_min, res_max, fault_classes=fault_classes,
+            impedance_sampling=impedance_sampling,
         )
         started = time.perf_counter()
         bank, feasible, phase_usage = generate_signature_bank(
@@ -309,6 +335,13 @@ def build_dataset(
     signature_bank = np.stack(bank_list).astype(np.float32)
     mask = np.stack(mask_list).astype(np.float32)
     edge_mask = np.stack(edge_mask_list).astype(np.float32)
+    edge_mask_true = np.broadcast_to(
+        edge_mask_true_row, (len(edge_mask), len(edge_mask_true_row))
+    ).copy()
+    edge_mask_obs = edge_mask_true.copy()
+    validate_edge_masks(
+        edge_universe["edge_pair_id"], edge_mask_true, edge_mask_obs
+    )
     candidate_mask = np.stack(candidate_mask_list).astype(np.float32)
     y_detect = np.asarray(y_detect, dtype=np.int64)
     y_loc = np.asarray(y_loc, dtype=np.int64)
@@ -392,6 +425,14 @@ def build_dataset(
         "edge_index": edge_index,
         "edge_attr": edge_attr,
         "edge_mask": edge_mask,
+        "edge_index_universe": edge_index_universe,
+        "edge_attr_universe": edge_attr_universe,
+        "edge_pair_id": edge_universe["edge_pair_id"],
+        "edge_direction": edge_universe["edge_direction"],
+        "edge_type": edge_universe["edge_type"],
+        "edge_attr_source": edge_universe["edge_attr_source"],
+        "edge_mask_true": edge_mask_true,
+        "edge_mask_obs": edge_mask_obs,
         "signature_bank": signature_bank,
         "candidate_mask": candidate_mask,
         "y_detect": y_detect,
@@ -415,8 +456,25 @@ def build_dataset(
         "n_nodes": int(n_nodes),
         "n_candidates": int(n_nodes + 1),
         "n_edges": int(len(edge_index)),
+        "n_true_edges": int(len(edge_index)),
+        "n_universe_edges": int(len(edge_index_universe)),
         "directed_edge_count": int(len(edge_index)),
         "undirected_edge_count": int(len(edge_index) // 2),
+        "n_true_undirected_edges": int(len(edge_index) // 2),
+        "n_universe_undirected_edges": int(len(edge_index_universe) // 2),
+        "edge_type_map": {
+            "0": "真实线路或变压器",
+            "3": "重复边或平行边",
+        },
+        "edge_attr_source_map": {
+            "0": "仿真器参数",
+            "2": "捐赠边复制参数",
+        },
+        "universe_policy": "真实边加可选候选虚增边；候选边按无向边展开为双向边",
+        "edge_mask_semantics": {
+            "edge_mask_true": "真实物理拓扑中的边",
+            "edge_mask_obs": "模型实际观测到的边",
+        },
         "n_samples": int(total),
         "n_fault": int(n_fault),
         "n_normal": int(n_normal),
@@ -449,6 +507,7 @@ def build_dataset(
         "feature_scaler": "feature_scaler.npz",
         "res_min": float(res_min),
         "res_max": float(res_max),
+        "impedance_sampling": impedance_sampling,
         "seed": int(seed),
         "counterfactual_perturbation": "disabled",
         "group_id_semantics": "同一非负 group_id 下共享事件参数和无扰动窗口生成",
@@ -462,6 +521,7 @@ def build_dataset(
         "bus_phase_nodes": [
             list(phases) for phases in simulator._bus_phase_nodes
         ],
+        "excluded_source_buses": list(getattr(simulator, "excluded_bus_names", [])),
         "simulation_calls": int(simulation_calls),
         "simulation_seconds": round(float(simulation_seconds), 4),
     }
@@ -497,5 +557,30 @@ def load_dataset(output_dir: Path) -> dict:
             result[name] = np.empty(0, dtype=np.int64)
         else:
             result[name] = np.load(path, allow_pickle=False)
+    optional_names = (
+        "edge_index_universe", "edge_attr_universe", "edge_pair_id",
+        "edge_direction", "edge_type", "edge_attr_source",
+        "edge_mask_true", "edge_mask_obs",
+    )
+    for name in optional_names:
+        path = output_dir / f"{name}.npy"
+        if path.exists():
+            result[name] = np.load(path, allow_pickle=False)
+    if "edge_index_universe" not in result:
+        result["edge_index_universe"] = result["edge_index"]
+        result["edge_attr_universe"] = result["edge_attr"]
+        result["edge_pair_id"] = np.repeat(
+            np.arange(len(result["edge_index"]) // 2, dtype=np.int64), 2
+        )
+        result["edge_direction"] = np.tile(
+            np.asarray([0, 1], dtype=np.int64), len(result["edge_index"]) // 2
+        )
+        result["edge_type"] = np.zeros(len(result["edge_index"]), dtype=np.int64)
+        result["edge_attr_source"] = np.zeros(len(result["edge_index"]), dtype=np.int64)
+        result["edge_mask_true"] = result["edge_mask"]
+        result["edge_mask_obs"] = result["edge_mask"]
+    validate_edge_masks(
+        result["edge_pair_id"], result["edge_mask_true"], result["edge_mask_obs"]
+    )
     result["meta"] = json.loads((output_dir / "meta.json").read_text(encoding="utf-8"))
     return result

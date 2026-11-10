@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from ..data_generation.topology import validate_edge_masks
+
 
 def load_arrays(directory: Path) -> dict:
     """以内存映射读取既有数据，不复制完整签名库或改写原数组。"""
@@ -15,6 +17,28 @@ def load_arrays(directory: Path) -> dict:
     names = ("X_obs", "signature_bank", "mask", "candidate_mask", "edge_index",
              "edge_attr", "edge_mask", "group_id", "y_loc", "y_resist")
     data = {name: np.load(directory / f"{name}.npy", mmap_mode="r", allow_pickle=False) for name in names}
+    optional_names = (
+        "edge_index_universe", "edge_attr_universe", "edge_pair_id",
+        "edge_direction", "edge_type", "edge_attr_source",
+        "edge_mask_true", "edge_mask_obs",
+    )
+    for name in optional_names:
+        path = directory / f"{name}.npy"
+        if path.exists():
+            data[name] = np.load(path, mmap_mode="r", allow_pickle=False)
+    if "edge_index_universe" not in data:
+        data["edge_index_universe"] = data["edge_index"]
+        data["edge_attr_universe"] = data["edge_attr"]
+        data["edge_pair_id"] = np.repeat(
+            np.arange(len(data["edge_index"]) // 2, dtype=np.int64), 2
+        )
+        data["edge_direction"] = np.tile(
+            np.asarray([0, 1], dtype=np.int64), len(data["edge_index"]) // 2
+        )
+        data["edge_type"] = np.zeros(len(data["edge_index"]), dtype=np.int64)
+        data["edge_attr_source"] = np.zeros(len(data["edge_index"]), dtype=np.int64)
+        data["edge_mask_true"] = data["edge_mask"]
+        data["edge_mask_obs"] = data["edge_mask"]
     data["meta"] = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
     x, bank = data["X_obs"], data["signature_bank"]
     if x.ndim != 4 or bank.shape != (x.shape[0], x.shape[1] + 1, *x.shape[1:]):
@@ -33,6 +57,19 @@ def load_arrays(directory: Path) -> dict:
             raise ValueError(f"{name} 必须为零一掩码")
     if (data["mask"].sum(axis=1) == 0).any():
         raise ValueError("数据含无有效观测的样本")
+    if data["edge_index_universe"].ndim != 2 or data["edge_index_universe"].shape[1] != 2:
+        raise ValueError("候选全集边索引必须为 [E,2]")
+    if data["edge_attr_universe"].shape[0] != data["edge_index_universe"].shape[0]:
+        raise ValueError("候选全集边属性与边索引行数不匹配")
+    if data["edge_pair_id"].shape != (data["edge_index_universe"].shape[0],):
+        raise ValueError("edge_pair_id 形状不匹配")
+    if data["edge_mask_true"].shape != data["edge_mask_obs"].shape:
+        raise ValueError("真实与观测边掩码形状不一致")
+    if data["edge_mask_true"].shape[0] != len(x) or data["edge_mask_true"].shape[1] != data["edge_index_universe"].shape[0]:
+        raise ValueError("边掩码与样本或候选全集形状不匹配")
+    validate_edge_masks(
+        data["edge_pair_id"], data["edge_mask_true"], data["edge_mask_obs"]
+    )
     return data
 
 
@@ -62,18 +99,125 @@ def fit_normalization(data: dict, train_indices: np.ndarray, progress=None) -> d
             "train_indices": np.asarray(train_indices, dtype=np.int64)}
 
 
-def make_batch(data: dict, indices: np.ndarray, normalization: dict, device: torch.device) -> dict:
-    """在原存储坐标中应用训练侧仿射变换，然后构建设备张量。"""
+def make_batch(
+    data: dict, indices: np.ndarray, normalization: dict, device: torch.device,
+    graph_view: str = "true",
+) -> dict:
+    """在原存储坐标中应用训练侧仿射变换，然后构建设备张量。
+
+    `true` 保持旧训练路径；`universe` 使用候选全集和逐样本观测边掩码。
+    """
+    if graph_view not in ("true", "universe"):
+        raise ValueError("graph_view 必须为 true 或 universe")
+    if graph_view == "true":
+        edge_index = data["edge_index"]
+        edge_attr = data["edge_attr"]
+        edge_mask = data["edge_mask"][indices]
+    else:
+        edge_index = data["edge_index_universe"]
+        edge_attr = data["edge_attr_universe"]
+        edge_mask = data["edge_mask_obs"][indices]
     mean, std = normalization["mean"][:, None, :], normalization["std"][:, None, :]
     observation = (data["X_obs"][indices] - mean) / std
     target = (data["signature_bank"][indices] - mean) / std
     arrays = {
         "observation": observation, "target": target,
         "node_mask": data["mask"][indices], "candidate_mask": data["candidate_mask"][indices],
-        "edge_mask": data["edge_mask"][indices], "location": data["y_loc"][indices],
-        "edge_index": np.array(data["edge_index"]), "edge_attr": np.array(data["edge_attr"]),
+        "edge_mask": edge_mask, "location": data["y_loc"][indices],
+        "edge_index": np.array(edge_index), "edge_attr": np.array(edge_attr),
     }
     batch = {key: torch.as_tensor(value, device=device) for key, value in arrays.items()}
     batch["observation"] = batch["observation"].float()
     batch["target"] = batch["target"].float()
+    return batch
+
+
+def sample_node_masks(
+    locations: np.ndarray, n_nodes: int, rng: np.random.Generator, *,
+    full_probability: float = 0.25, min_observed: int = 15, max_observed: int = 37,
+    force_observed_probability: float = 0.5,
+) -> np.ndarray:
+    """为训练批次生成节点观测掩码，返回 `[B,n_nodes]`。
+
+    每个事件先以 `full_probability` 保留完整观测；其余事件随机抽取
+    `[min_observed, max_observed]` 个节点，并对故障事件以
+    `force_observed_probability` 强制包含或强制排除真实故障节点。这样一批数据
+    同时覆盖完整观测、真实节点被观测、真实节点未被观测与随机部分观测。
+    """
+    locations = np.asarray(locations, dtype=np.int64)
+    if not 0.0 <= full_probability <= 1.0:
+        raise ValueError("full_probability 必须位于 [0,1]")
+    if not 0.0 <= force_observed_probability <= 1.0:
+        raise ValueError("force_observed_probability 必须位于 [0,1]")
+    if n_nodes < 1 or not 1 <= min_observed <= max_observed <= n_nodes:
+        raise ValueError("观测节点数区间必须满足 1<=min<=max<=n_nodes")
+    masks = np.zeros((locations.size, n_nodes), dtype=np.float32)
+    all_nodes = np.arange(n_nodes)
+    for row, location in enumerate(locations):
+        if rng.random() < full_probability:
+            masks[row] = 1.0
+            continue
+        count = int(rng.integers(min_observed, max_observed + 1))
+        if count >= n_nodes:
+            masks[row] = 1.0
+            continue
+        if location >= 0 and rng.random() < force_observed_probability:
+            others = all_nodes[all_nodes != int(location)]
+            selected = np.concatenate([[int(location)], rng.choice(others, size=count - 1, replace=False)])
+        else:
+            pool = all_nodes[all_nodes != int(location)] if location >= 0 else all_nodes
+            selected = rng.choice(pool, size=count, replace=False)
+        masks[row, selected] = 1.0
+    return masks
+
+
+def build_undirected_edge_groups(edge_index: np.ndarray) -> list[np.ndarray]:
+    """把双向边按无向边分组，返回每个无向边对应的全部行索引。
+
+    当前数据把每条无向边展开为两个有向边。训练期边删除必须成对处理，
+    否则会得到只有单方向消息的非物理图。本函数按端点排序后的二元组分组，
+    并保持组顺序确定，便于复现。
+    """
+    grouped: dict[tuple[int, int], list[int]] = {}
+    for row, (source, target) in enumerate(np.asarray(edge_index, dtype=np.int64)):
+        key = (int(min(source, target)), int(max(source, target)))
+        grouped.setdefault(key, []).append(int(row))
+    return [np.asarray(grouped[key], dtype=np.int64) for key in sorted(grouped)]
+
+
+def apply_edge_drop(
+    batch: dict,
+    edge_groups: list[np.ndarray],
+    drop_prob: float,
+    max_drop: int,
+    rng: np.random.Generator,
+) -> dict:
+    """对批次中的每个样本随机删除若干无向边，并原地修改 edge_mask。
+
+    `drop_prob` 为单个样本启用删除的概率；启用后从 1 到 `max_drop` 中均匀抽取
+    删除条数，成对清除该无向边对应的全部有向边。该函数只修改模型输入的掩码，
+    不改变观测、目标或标签，因此物理响应仍来自真实拓扑。
+    """
+    if not 0.0 <= float(drop_prob) <= 1.0:
+        raise ValueError("drop_prob 必须位于 [0, 1]")
+    if int(max_drop) < 1:
+        raise ValueError("max_drop 必须为正整数")
+    mask = batch["edge_mask"]
+    if mask.ndim != 2:
+        raise ValueError("edge_mask 必须为 [B,E]")
+    if not edge_groups:
+        return batch
+    # 在 CPU 上批量修改小掩码，避免逐条边触发 GPU 同步。
+    mask_np = mask.detach().cpu().numpy().copy()
+    for row in range(mask_np.shape[0]):
+        if float(rng.random()) >= float(drop_prob):
+            continue
+        available = [group for group in edge_groups if mask_np[row, group[0]] > 0]
+        if not available:
+            continue
+        count = min(int(rng.integers(1, int(max_drop) + 1)), len(available))
+        chosen = rng.choice(len(available), size=count, replace=False)
+        for index in np.atleast_1d(chosen):
+            mask_np[row, available[int(index)]] = 0.0
+    batch["edge_mask"] = torch.as_tensor(mask_np, device=mask.device, dtype=mask.dtype)
     return batch

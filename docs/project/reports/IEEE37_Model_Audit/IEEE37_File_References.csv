@@ -1,0 +1,5 @@
+﻿Type,Reference,SourceFile,SourceLine,Exists,ResolvedPath,Note
+redirect,IEEELineCodes.DSS,ieee37.dss,22,yes,D:\ds_harness\codex_project\method_a2\code\method-a2\data\electrical-audit-ieee37-20261103\IEEELineCodes.DSS,resolved relative to ieee37.dss
+buscoords,IEEE37_BusXY.csv,ieee37.dss,102,yes,D:\ds_harness\codex_project\method_a2\code\method-a2\data\electrical-audit-ieee37-20261103\IEEE37_BusXY.csv,resolved relative to ieee37.dss
+entry,ieee37.dss,ieee37.dss,1,yes,D:\ds_harness\codex_project\method_a2\code\method-a2\data\electrical-audit-ieee37-20261103\ieee37.dss,compiled by OpenDSS
+auxiliary (not referenced),ieee37_EXP_METERS.CSV,,,yes,C:\Program Files\OpenDSS\IEEETestCases\37Bus\ieee37_EXP_METERS.CSV,historical meter export; not an input to the electrical model

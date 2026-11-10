@@ -1,0 +1,73 @@
+IEEE 37 OpenDSS Solver Log
+========================================================================
+generated_at: 2026-11-09T17:43:21
+source_dir: D:\ds_harness\codex_project\method_a2\code\method-a2\data\electrical-audit-ieee37-20261103
+master_file: ieee37.dss
+sha256_ieee37: 97c2571c1698be56c164d3b4c3a1c7a536df976631d3dba4d5108b8b44498b81
+sha256_linecodes: 855910b3757efb1084c8310747a3459881cc135bd773665cdd6db16ff9b50ae1
+opendss_version: Version 11.0.0.1 (64-bit build) - Charlottesville; License Status: Open 
+compile_command: Compile "D:\ds_harness\codex_project\method_a2\code\method-a2\data\electrical-audit-ieee37-20261103\ieee37.dss"
+compile_error_number: 0
+compile_error_description: ''
+circuit_name: ieee37
+wall_time_s: 0.480696439743042
+num_buses: 39
+num_nodes: 117
+num_elements: 73
+converged: True
+iterations: 14
+control_iterations: 4
+total_iterations: 14
+max_iterations: 100
+tolerance: 0.0001
+frequency_hz: 60.0
+mode: 0
+control_mode: 0
+total_time_ms: 448.8
+process_time_ms: 432.09999999999997
+
+Key results
+------------------------------------------------------------------------
+bus_count_with_sourcebus: 39
+bus_count_network: 38
+phase_nodes: 117
+feeder_lines: 35
+jumpers: 1
+loads: 30
+load_branches: 32
+transformers: 4
+regulators: 2
+load_kw: 2457.0
+load_kvar: 1201.0
+load_kva: 2734.8217492187678
+load_pf: 0.898413214938732
+min_bus: 799 0.9232177457666121
+max_bus: 799r 1.0294173271640858
+max_unbalance_bus: 740 3.440751305596654
+max_current_line: L35 369.6241879941502
+max_line_loading_pct: 92.40604699853755
+subxf_loading_pct: 121.14950572859333
+subxf_current_loading_pct: 135.18121277154782
+reg1a_loading_pct: 90.09616420457253
+reg1c_loading_pct: 88.53491131088856
+reg1a_tap: 1.1
+reg1c_tap: 1.0875
+
+Checks
+------------------------------------------------------------------------
+feeder_is_tree: True
+bus_components: 1
+cycle_rank: 2
+parallel_edge_groups: 1
+isolated_buses: 0
+phase_errors: 0
+phase_node_components: 1
+max_yprim_impedance_diff_ohm: 1.1443916996305594e-16
+
+Limitations
+------------------------------------------------------------------------
+- COM 接口未暴露完整解析器警告列表；仅检查 Error.Number/Description。
+- ZscRefresh 会改变求解状态；本次在所有电压/电流/功率读取完成后才刷新。
+- Line.R1 / LineCode.R1 标量属性存在活动对象缓存；本审计使用 3×3 矩阵。
+- 本次为 60 Hz 单快照正常工况，不含故障、时序或 50 Hz 场景。
+- 原始 .rar 本体未在文件系统中找到；使用此前解压目录，三个电气文件与 canonical 安装逐字节一致。
