@@ -308,7 +308,8 @@ def run(args: argparse.Namespace) -> Path:
             raise ValueError("node_mask_full_probability 必须位于 [0,1]")
         if not 0.0 <= args.node_mask_force_observed_probability <= 1.0:
             raise ValueError("node_mask_force_observed_probability 必须位于 [0,1]")
-    if not args.tolerance_source.strip() or args.epochs < 1 or args.batch_size < 1:
+    if (not args.tolerance_source.strip() or args.epochs < 1 or args.batch_size < 1
+            or args.early_stopping_patience < 0):
         raise ValueError("必须提供容差来源及正的轮数、批大小")
     if not 0 < args.val_ratio < 1 or not 0 < args.test_ratio < 1 or args.val_ratio + args.test_ratio >= 1:
         raise ValueError("验证、测试比例必须为正且总和小于一")
@@ -465,6 +466,7 @@ def run(args: argparse.Namespace) -> Path:
         term_keys = TERM_KEYS.get(args.loss_mode, ())
         term_mode = bool(term_keys)
         history, best_key, best_epoch = [], None, None
+        stale_epochs = 0
         save_epochs = {
             int(item) for item in str(getattr(args, "save_epochs", "")).split(",") if item.strip()
         }
@@ -553,17 +555,27 @@ def run(args: argparse.Namespace) -> Path:
                 writer.writerows(history)
             if best_key is None or key > best_key:
                 best_key, best_epoch = key, epoch
+                stale_epochs = 0
                 torch.save({"model_state_dict": model.state_dict(), "model_config": model_config,
                             "best_epoch": epoch, "loss_mode": args.loss_mode,
                             "rank_temperature": args.rank_temperature}, output_dir / "model.pt")
                 torch.save({"model_state_dict": model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "epoch": epoch}, output_dir / "optimizer.pt")
+            else:
+                stale_epochs += 1
             if epoch in save_epochs:
                 torch.save({"model_state_dict": model.state_dict(), "model_config": model_config,
                             "epoch": epoch, "loss_mode": args.loss_mode,
                             "rank_temperature": args.rank_temperature},
                            output_dir / f"checkpoint-epoch{epoch:03d}.pt")
+            if (args.early_stopping_patience > 0
+                    and stale_epochs >= args.early_stopping_patience):
+                progress.update("training", "batch", epoch * batch_count, training_steps,
+                                note=f"early stop at epoch {epoch}",
+                                unit_seconds=time.perf_counter() - started,
+                                force=True, kind="stage_done")
+                break
             # 末批的计时含当轮验证与保存，剩余时间覆盖后续训练轮的这些开销。
             progress.update("training", "batch", epoch * batch_count, training_steps, note=epoch_note,
                             unit_seconds=time.perf_counter() - started, force=epoch == args.epochs,
@@ -703,7 +715,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="训练时每个样本随机删除无向边的概率；0 表示不启用")
     parser.add_argument("--edge-drop-max", type=int, default=3,
                         help="每个启用删除的样本最多删除的无向边数")
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--early-stopping-patience", type=int, default=30,
+                        help="验证主指标连续无改善的轮数；0 表示不启用早停")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--val-ratio", type=float, default=0.15)
